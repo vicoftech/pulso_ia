@@ -9,11 +9,14 @@ __pycache__/
 *.tfstate
 *.tfstate.*
 tfplan
+infra/backend.hcl
 
 # Local outputs
 /tmp/
 dist/
 features/
+infra/invoke_out.json
+infra/invoke_ph.json
 
 # Keep only source files in lambdas (no vendored deps)
 lambdas/**/*

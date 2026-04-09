@@ -4,10 +4,16 @@ import logging
 import os
 import sys
 from concurrent.futures import ThreadPoolExecutor
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../shared"))
 
-from sources import SOURCE_REGISTRY
+_pkg = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _pkg)
+_shared = os.path.normpath(os.path.join(_pkg, "..", "..", "shared"))
+if os.path.isdir(_shared):
+    sys.path.insert(0, _shared)
+
+# Import dynamo before sources: source modules prepend sys.path and can shadow /var/task.
 from dynamo import batch_get_existing_ids
+from sources import SOURCE_REGISTRY
 
 logger = logging.getLogger()
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))

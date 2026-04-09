@@ -6,7 +6,13 @@ import os
 import time
 import requests
 import sys
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../shared"))
+
+_pkg = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _pkg)
+_shared = os.path.normpath(os.path.join(_pkg, "..", "..", "shared"))
+if os.path.isdir(_shared):
+    sys.path.insert(0, _shared)
+
 from dynamo import mark_as_sent
 
 logger = logging.getLogger()

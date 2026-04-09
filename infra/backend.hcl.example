@@ -1,0 +1,47 @@
+# Antes de usar estado remoto: en infra/main.tf, dentro del bloque terraform { }, agregá:
+#   backend "s3" {}
+#
+# --- Sin terraform.tfstate en esta máquina (el state está en otra PC) ---
+#
+# En infra/, con AWS CLI configurado (sin backend "s3" {} en main.tf):
+#   terraform init
+#   .\import_existing.ps1 -AwsProfile asap_main -Region us-east-1
+# (Opción -IncludeStateBackend si el bucket de estado ya existe en la cuenta.)
+#
+# Luego:
+#   terraform plan -var="aws_region=us-east-1"
+#
+# Armá backend.hcl con el bucket real y subí el state:
+#   terraform init -backend-config=backend.hcl -migrate-state
+#
+# Más simple si podés: copiar terraform.tfstate de la otra máquina a infra/ y solo
+# hacer init -backend-config=backend.hcl -migrate-state (sin script de import).
+#
+# --- Migrar estado local a S3 (una sola vez) ---
+#
+# 1) Crear bucket y tabla de lock con estado local:
+#      cd infra
+#      terraform init
+#      terraform apply
+#
+# 2) Obtener el nombre del bucket (incluye tu account id):
+#      terraform output -raw terraform_state_bucket
+#
+# 3) Copiar este archivo a backend.hcl y reemplazar ACCOUNT_ID en bucket=...
+#    (o pegar el valor completo del output). dynamodb_table debe ser
+#    "<project_name>-terraform-locks" (por defecto pulso-ia-terraform-locks).
+#
+# 4) Subir el estado y activar el backend remoto:
+#      terraform init -backend-config=backend.hcl -migrate-state
+#
+#    Confirmar con "yes" para copiar el estado actual a S3.
+#
+# --- Clon nuevo (el bucket ya existe en la cuenta) ---
+# Copiá backend.hcl (o armalo desde este ejemplo con el bucket real) y:
+#      terraform init -backend-config=backend.hcl
+
+bucket         = "pulso-ia-terraform-state-ACCOUNT_ID"
+key            = "infra/terraform.tfstate"
+region         = "us-east-1"
+encrypt        = true
+dynamodb_table = "pulso-ia-terraform-locks"

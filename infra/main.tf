@@ -1,4 +1,6 @@
 terraform {
+  required_version = ">= 1.0"
+
   required_providers {
     aws = {
       source  = "hashicorp/aws"
@@ -9,6 +11,11 @@ terraform {
       version = "~> 2.4"
     }
   }
+
+  # Estado remoto S3: añadí dentro de este bloque terraform { ... }:
+  #   backend "s3" {}
+  # y ejecutá terraform init -backend-config=backend.hcl (-migrate-state si venís de state local).
+  # Ver backend.hcl.example. Sin ese bloque, el state es local (útil para import en una máquina nueva).
 }
 
 provider "aws" {
@@ -114,18 +121,18 @@ resource "aws_iam_role_policy" "fetch_policy" {
     Version = "2012-10-17"
     Statement = [
       {
-        Effect = "Allow"
-        Action = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:BatchGetItem", "dynamodb:BatchWriteItem"]
+        Effect   = "Allow"
+        Action   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:BatchGetItem", "dynamodb:BatchWriteItem"]
         Resource = aws_dynamodb_table.items.arn
       },
       {
-        Effect = "Allow"
-        Action = ["ssm:GetParameter"]
+        Effect   = "Allow"
+        Action   = ["ssm:GetParameter"]
         Resource = "arn:aws:ssm:${var.aws_region}:*:parameter/pulso-ia/*"
       },
       {
-        Effect = "Allow"
-        Action = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
+        Effect   = "Allow"
+        Action   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
         Resource = "*"
       }
     ]
@@ -139,18 +146,18 @@ resource "aws_iam_role_policy" "filter_policy" {
     Version = "2012-10-17"
     Statement = [
       {
-        Effect = "Allow"
-        Action = ["dynamodb:PutItem", "dynamodb:BatchWriteItem"]
+        Effect   = "Allow"
+        Action   = ["dynamodb:PutItem", "dynamodb:BatchWriteItem"]
         Resource = aws_dynamodb_table.items.arn
       },
       {
-        Effect = "Allow"
-        Action = ["bedrock:InvokeModel"]
+        Effect   = "Allow"
+        Action   = ["bedrock:InvokeModel"]
         Resource = "*"
       },
       {
-        Effect = "Allow"
-        Action = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
+        Effect   = "Allow"
+        Action   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
         Resource = "*"
       }
     ]
@@ -164,28 +171,37 @@ resource "aws_iam_role_policy" "publish_policy" {
     Version = "2012-10-17"
     Statement = [
       {
-        Effect = "Allow"
-        Action = ["dynamodb:UpdateItem", "dynamodb:Query"]
+        Effect   = "Allow"
+        Action   = ["dynamodb:UpdateItem", "dynamodb:Query"]
         Resource = [aws_dynamodb_table.items.arn, "${aws_dynamodb_table.items.arn}/index/*"]
       },
       {
-        Effect = "Allow"
-        Action = ["ssm:GetParameter"]
+        Effect   = "Allow"
+        Action   = ["ssm:GetParameter"]
         Resource = "arn:aws:ssm:${var.aws_region}:*:parameter/pulso-ia/*"
       },
       {
-        Effect = "Allow"
-        Action = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
+        Effect   = "Allow"
+        Action   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
         Resource = "*"
       }
     ]
   })
 }
 
+# Lambda Python layers must use python/lib/<runtime>/site-packages/ so imports resolve.
 data "archive_file" "shared_layer" {
   type        = "zip"
-  source_dir  = "${path.module}/../shared"
   output_path = "${path.module}/../dist/shared_layer.zip"
+
+  source {
+    content  = file("${path.module}/../shared/dynamo.py")
+    filename = "python/lib/python3.12/site-packages/dynamo.py"
+  }
+  source {
+    content  = file("${path.module}/../shared/models.py")
+    filename = "python/lib/python3.12/site-packages/models.py"
+  }
 }
 
 resource "aws_lambda_layer_version" "shared" {

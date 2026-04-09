@@ -48,23 +48,67 @@ class ProductHuntSource(BaseSource):
                 "https://api.producthunt.com/v2/api/graphql",
                 json=payload, headers=headers, timeout=15
             )
-            data = resp.json()["data"]["posts"]
-            for edge in data["edges"]:
-                node = edge["node"]
-                created = datetime.fromisoformat(node["createdAt"].replace("Z", "+00:00"))
+            try:
+                body = resp.json()
+            except ValueError as e:
+                raise ValueError(f"Product Hunt: invalid JSON (HTTP {resp.status_code})") from e
+
+            if resp.status_code >= 400:
+                raise ValueError(
+                    f"Product Hunt HTTP {resp.status_code}: {str(body)[:400]}"
+                )
+
+            data_root = body.get("data")
+            if data_root is None:
+                errs = body.get("errors") or []
+                msg = errs[0].get("message", str(errs)) if errs else "data is null"
+                raise ValueError(f"Product Hunt GraphQL: {msg}")
+
+            posts = data_root.get("posts")
+            if posts is None:
+                break
+
+            edges = posts.get("edges") or []
+            page_info = posts.get("pageInfo") or {}
+
+            for edge in edges:
+                node = edge.get("node") if isinstance(edge, dict) else None
+                if not isinstance(node, dict):
+                    continue
+                created_raw = node.get("createdAt")
+                if not created_raw:
+                    continue
+                created = datetime.fromisoformat(
+                    created_raw.replace("Z", "+00:00")
+                )
                 if created < cutoff:
                     has_next = False
                     break
-                topics = {e["node"]["name"] for e in node["topics"]["edges"]}
+
+                topic_edges = (node.get("topics") or {}).get("edges") or []
+                topics = set()
+                for te in topic_edges:
+                    if not isinstance(te, dict):
+                        continue
+                    tn = te.get("node")
+                    if isinstance(tn, dict) and tn.get("name"):
+                        topics.add(tn["name"])
+
                 if not topics.intersection(AI_TOPICS):
                     continue
+
+                name = node.get("name") or "Untitled"
+                url = node.get("url") or ""
+                tagline = node.get("tagline") or ""
+                desc = (node.get("description") or "")[:300]
                 items.append(RawNewsItem(
-                    title=node["name"],
-                    url=node["url"],
+                    title=name,
+                    url=url,
                     source=self.source_id(),
                     published_at=created.isoformat(),
-                    raw_content=f"{node['tagline']}. {(node['description'] or '')[:300]}"
+                    raw_content=f"{tagline}. {desc}"
                 ))
-            cursor = data["pageInfo"]["endCursor"]
-            has_next = has_next and data["pageInfo"]["hasNextPage"]
+
+            cursor = page_info.get("endCursor")
+            has_next = has_next and bool(page_info.get("hasNextPage"))
         return items
