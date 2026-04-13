@@ -11,7 +11,7 @@ _shared = os.path.normpath(os.path.join(_pkg, "..", "..", "shared"))
 if os.path.isdir(_shared):
     sys.path.insert(0, _shared)
 
-from dynamo import batch_save_items
+from dynamo import batch_get_telegram_sent, batch_save_items
 from models import ProcessedNewsItem
 from datetime import datetime, timezone
 
@@ -81,6 +81,7 @@ def handler(event, context):
                                 "relevance_score": 0, "summary_es": ""} for it in batch]
 
         item_map = {it["item_id"]: it for it in batch}
+        preserved_sent = batch_get_telegram_sent([it["item_id"] for it in batch])
         for cl in classifications:
             raw = item_map.get(cl["item_id"], {})
             processed = ProcessedNewsItem(
@@ -93,8 +94,11 @@ def handler(event, context):
                 published_at=raw.get("published_at", now),
                 processed_at=now,
                 is_relevant=cl.get("is_relevant", False),
-                relevance_score=cl.get("relevance_score", 0)
+                relevance_score=cl.get("relevance_score", 0),
             )
+            prev = preserved_sent.get(cl["item_id"], "false")
+            if prev in ("queued", "true"):
+                processed.telegram_sent = prev
             all_results.append(processed)
             if processed.is_relevant and processed.relevance_score >= THRESHOLD:
                 relevant_items.append(processed.__dict__)

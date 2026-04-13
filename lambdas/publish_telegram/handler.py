@@ -2,6 +2,7 @@
 import json
 import logging
 import os
+import sys
 import time
 from datetime import datetime, timezone
 from html import escape as html_escape
@@ -9,14 +10,18 @@ from html import escape as html_escape
 import boto3
 import requests
 
+_pkg = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _pkg)
+_shared = os.path.normpath(os.path.join(_pkg, "..", "..", "shared"))
+if os.path.isdir(_shared):
+    sys.path.insert(0, _shared)
+
+from dynamo import mark_as_queued, mark_as_sent, query_by_telegram_status
+
 logger = logging.getLogger()
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 
-TABLE_NAME = os.environ["DYNAMODB_TABLE"]
 CHANNEL_ID = os.environ["TELEGRAM_CHANNEL_ID"]
-
-dynamodb = boto3.resource("dynamodb")
-table = dynamodb.Table(TABLE_NAME)
 
 CATEGORY_MAP = {
     "NEW_PRODUCT": {"emoji": "🚀", "label": "NEW PRODUCT"},
@@ -45,6 +50,25 @@ def _source_meta(source: str) -> dict:
         name = source.replace("rss_", "").replace("_", " ").title()
         return {"icon": "📰", "name": name}
     return {"icon": "📡", "name": source or "feed"}
+
+
+def _published_at_sort_key(item: dict) -> str:
+    return (item.get("published_at") or "")[:32]
+
+
+def build_publication_queue(relevant_items: list[dict]) -> list[dict]:
+    """
+    Orden: primero ítems ya en cola (telegram_sent=queued), luego los nuevos del barrido,
+    cada bloque ordenado por published_at ascendente (la menos reciente = más antigua primero).
+    """
+    backlog = query_by_telegram_status("queued")
+    backlog_ids = {x["item_id"] for x in backlog}
+    backlog_sorted = sorted(backlog, key=_published_at_sort_key)
+
+    new_items = [dict(i) for i in relevant_items if i.get("item_id") not in backlog_ids]
+    new_sorted = sorted(new_items, key=_published_at_sort_key)
+
+    return backlog_sorted + new_sorted
 
 
 def build_card(item: dict) -> str:
@@ -157,30 +181,58 @@ def send_card(
 
 
 def handler(event, context):
-    relevant_items = event.get("relevant_items", [])
-    if not relevant_items:
-        logger.info("No relevant items to publish")
-        return {"published": 0, "sent": 0, "failed": 0, "total": 0}
+    relevant_items = event.get("relevant_items") or []
+
+    combined = build_publication_queue(relevant_items)
+    if not combined:
+        logger.info("Empty publication queue (no queued items and no new relevant)")
+        return {
+            "published": 0,
+            "sent": 0,
+            "failed": 0,
+            "total_new_in_run": len(relevant_items),
+            "queued_remaining": 0,
+        }
+
+    to_send = combined[0]
+    remainder = combined[1:]
+    queued_remaining = len(remainder)
 
     token = get_bot_token()
     sent = 0
     failed = 0
 
-    for item in relevant_items:
-        try:
-            result = send_card(token, item)
-            if result:
-                table.update_item(
-                    Key={"item_id": item["item_id"]},
-                    UpdateExpression="SET telegram_sent = :t, telegram_message_id = :mid",
-                    ExpressionAttributeValues={":t": "true", ":mid": result.get("message_id")},
-                )
-                sent += 1
-            else:
-                failed += 1
-            time.sleep(1)
-        except Exception as e:
-            failed += 1
-            logger.error(json.dumps({"error": str(e), "item_id": item.get("item_id")}))
+    try:
+        result = send_card(token, to_send)
+        if result:
+            mid = result.get("message_id")
+            mark_as_sent(to_send["item_id"], mid)
+            sent = 1
+            for it in remainder:
+                if it.get("telegram_sent") not in ("queued", "true"):
+                    mark_as_queued(it["item_id"])
+        else:
+            failed = 1
+    except Exception as e:
+        failed = 1
+        logger.error(json.dumps({"error": str(e), "item_id": to_send.get("item_id")}))
 
-    return {"published": sent, "sent": sent, "failed": failed, "total": len(relevant_items)}
+    logger.info(
+        json.dumps(
+            {
+                "action": "publish_cadence",
+                "sent": sent,
+                "failed": failed,
+                "queued_remaining_after": len(remainder) if sent else len(combined),
+                "item_id": to_send.get("item_id"),
+            }
+        )
+    )
+
+    return {
+        "published": sent,
+        "sent": sent,
+        "failed": failed,
+        "total_new_in_run": len(relevant_items),
+        "queued_remaining": len(remainder) if sent else len(combined),
+    }

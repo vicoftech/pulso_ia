@@ -38,6 +38,12 @@ variable "relevance_threshold" {
   default = "60"
 }
 
+variable "pipeline_schedule_expression" {
+  description = "Cadencia entre barridos del pipeline (EventBridge Scheduler). Por defecto 15 minutos."
+  type        = string
+  default     = "rate(15 minutes)"
+}
+
 variable "telegram_channel_id" {
   default = "-1003846999541"
 }
@@ -147,7 +153,7 @@ resource "aws_iam_role_policy" "filter_policy" {
     Statement = [
       {
         Effect   = "Allow"
-        Action   = ["dynamodb:PutItem", "dynamodb:BatchWriteItem"]
+        Action   = ["dynamodb:PutItem", "dynamodb:BatchWriteItem", "dynamodb:BatchGetItem"]
         Resource = aws_dynamodb_table.items.arn
       },
       {
@@ -353,28 +359,30 @@ resource "aws_sfn_state_machine" "pipeline" {
           NumericGreaterThan = 0
           Next               = "FilterAINews"
         }]
-        Default = "Done"
+        Default = "QueueDrainOnly"
+      }
+      QueueDrainOnly = {
+        Type       = "Pass"
+        Result = {
+          relevant_items  = []
+          total_processed = 0
+          total_relevant  = 0
+          by_category     = {}
+        }
+        ResultPath = "$.filter_result"
+        Next       = "PublishTelegram"
       }
       FilterAINews = {
         Type       = "Task"
         Resource   = aws_lambda_function.filter.arn
         InputPath  = "$.fetch_result"
         ResultPath = "$.filter_result"
-        Next       = "HasRelevantItems"
+        Next       = "PublishTelegram"
         Retry = [{
           ErrorEquals     = ["States.TaskFailed"]
           MaxAttempts     = 2
           IntervalSeconds = 30
         }]
-      }
-      HasRelevantItems = {
-        Type = "Choice"
-        Choices = [{
-          Variable           = "$.filter_result.total_relevant"
-          NumericGreaterThan = 0
-          Next               = "PublishTelegram"
-        }]
-        Default = "Done"
       }
       PublishTelegram = {
         Type      = "Task"
@@ -425,7 +433,7 @@ resource "aws_scheduler_schedule" "hourly" {
     mode = "OFF"
   }
 
-  schedule_expression = "rate(1 hour)"
+  schedule_expression = var.pipeline_schedule_expression
 
   target {
     arn      = aws_sfn_state_machine.pipeline.arn

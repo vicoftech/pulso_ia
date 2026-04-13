@@ -1,0 +1,72 @@
+[
+  {
+    "fuente": "arxiv",
+    "nombre": "arXiv (cs.AI, cs.LG, cs.CL, cs.CV, stat.ML)",
+    "link": "https://export.arxiv.org/api/query",
+    "descripcion": "Preprints académicos en categorías de IA, aprendizaje automático, NLP, visión y estadística. El pipeline consulta la API Atom de arXiv y filtra por fecha de envío.",
+    "tipo_integracion": "Atom API (HTTP) + feedparser"
+  },
+  {
+    "fuente": "producthunt",
+    "nombre": "Product Hunt",
+    "link": "https://api.producthunt.com/v2/api/graphql",
+    "descripcion": "Lanzamientos de productos; se filtran posts cuyos topics intersectan IA, ML, LLM, Developer Tools, etc. Requiere token OAuth en SSM (/pulso-ia/producthunt-token).",
+    "tipo_integracion": "GraphQL API (HTTPS) + Bearer token"
+  },
+  {
+    "fuente": "github",
+    "nombre": "GitHub (repositorios trending por topics)",
+    "link": "https://api.github.com/search/repositories",
+    "descripcion": "Búsqueda de repos con topics llm, ai+agents, machine-learning, generative-ai y umbral de estrellas; filtro por fecha de push. Requiere token en SSM (/pulso-ia/github-token).",
+    "tipo_integracion": "REST API v3 (HTTPS) + token personal"
+  },
+  {
+    "fuente": "rss_techcrunch_ai",
+    "nombre": "TechCrunch — Artificial Intelligence",
+    "link": "https://techcrunch.com/category/artificial-intelligence/feed/",
+    "descripcion": "Feed RSS de la vertical de IA de TechCrunch (noticias de industria y producto).",
+    "tipo_integracion": "RSS/Atom (feedparser)"
+  },
+  {
+    "fuente": "rss_venturebeat_ai",
+    "nombre": "VentureBeat — AI",
+    "link": "https://venturebeat.com/category/ai/feed/",
+    "descripcion": "Feed RSS de noticias de IA y negocios en VentureBeat.",
+    "tipo_integracion": "RSS/Atom (feedparser)"
+  },
+  {
+    "fuente": "rss_mit_tech_review",
+    "nombre": "MIT Technology Review",
+    "link": "https://www.technologyreview.com/feed/",
+    "descripcion": "Feed general del MIT Technology Review (incluye cobertura de ciencia y tecnología; el filtro LLM decide relevancia para el canal).",
+    "tipo_integracion": "RSS/Atom (feedparser)"
+  },
+  {
+    "fuente": "rss_openai_blog",
+    "nombre": "OpenAI Blog",
+    "link": "https://openai.com/blog/rss.xml",
+    "descripcion": "Anuncios y artículos oficiales del blog de OpenAI.",
+    "tipo_integracion": "RSS/Atom (feedparser)"
+  },
+  {
+    "fuente": "rss_anthropic_blog",
+    "nombre": "Anthropic",
+    "link": "https://www.anthropic.com/rss.xml",
+    "descripcion": "Feed RSS de Anthropic (modelos, seguridad y producto).",
+    "tipo_integracion": "RSS/Atom (feedparser)"
+  },
+  {
+    "fuente": "rss_google_deepmind",
+    "nombre": "Google DeepMind — Blog",
+    "link": "https://deepmind.google/blog/rss.xml",
+    "descripcion": "Publicaciones del blog de DeepMind (investigación y aplicaciones).",
+    "tipo_integracion": "RSS/Atom (feedparser)"
+  },
+  {
+    "fuente": "rss_the_batch",
+    "nombre": "The Batch (DeepLearning.AI)",
+    "link": "https://www.deeplearning.ai/the-batch/feed/",
+    "descripcion": "Newsletter/feed de Andrew Ng y DeepLearning.AI sobre IA en la práctica.",
+    "tipo_integracion": "RSS/Atom (feedparser)"
+  }
+]

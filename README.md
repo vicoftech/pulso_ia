@@ -164,9 +164,9 @@ AWS_PROFILE=<tu_profile> AWS_REGION=us-east-1 python3 scripts/initial_run.py
 
 ## Operación
 
-- Scheduler: `pulso-ia-hourly` (cada 1 hora)
-- State machine: `pulso-ia-pipeline`
-- Tabla DynamoDB: `pulso-ia_items`
+- Scheduler: `pulso-ia-hourly` — por defecto **cada 15 minutos** (`pipeline_schedule_expression` en Terraform).
+- State machine: `pulso-ia-pipeline` (si no hay ítems nuevos en el fetch, igual corre **publish** para drenar la cola en Dynamo).
+- Tabla DynamoDB: `pulso-ia_items` — `telegram_sent`: `false` | `queued` (pendiente de publicar) | `true`.
 
 CloudWatch logs:
 
