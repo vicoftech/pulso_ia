@@ -17,6 +17,7 @@ dist/
 features/
 infra/invoke_out.json
 infra/invoke_ph.json
+infra/invoke_publish*.json
 
 # Keep only source files in lambdas (no vendored deps)
 lambdas/**/*
