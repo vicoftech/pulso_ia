@@ -18,69 +18,89 @@ CHANNEL_ID = os.environ["TELEGRAM_CHANNEL_ID"]
 dynamodb = boto3.resource("dynamodb")
 table = dynamodb.Table(TABLE_NAME)
 
-# Telegram HTML: solo <b>, <i>, <u>, <s>, <code>, <pre>, <a href="">, etc. Sin CSS ni divs.
-CATEGORY_META = {
-    "NEW_PRODUCT": {"emoji": "🚀", "label": "Nuevo producto"},
-    "MODEL_UPDATE": {"emoji": "⚡", "label": "Modelo y actualización"},
-    "METHODOLOGY": {"emoji": "🧠", "label": "Metodología"},
-    "MARKET_NEWS": {"emoji": "📊", "label": "Industria"},
-    "USE_CASE": {"emoji": "💡", "label": "Caso de uso"},
-    "VIDEO_EXPLAINER": {"emoji": "🎬", "label": "Video"},
+CATEGORY_MAP = {
+    "NEW_PRODUCT": {"emoji": "🚀", "label": "NEW PRODUCT"},
+    "MODEL_UPDATE": {"emoji": "⚡", "label": "MODEL UPDATE"},
+    "METHODOLOGY": {"emoji": "🧠", "label": "METHODOLOGY"},
+    "MARKET_NEWS": {"emoji": "📊", "label": "MARKET NEWS"},
+    "USE_CASE": {"emoji": "💡", "label": "USE CASE"},
+    "VIDEO_EXPLAINER": {"emoji": "🎬", "label": "VIDEO"},
+    "UNCATEGORIZED": {"emoji": "📌", "label": "NEWS"},
 }
 
-SOURCE_META = {
-    "arxiv": {"icon": "📄", "label": "ArXiv"},
-    "producthunt": {"icon": "🐱", "label": "Product Hunt"},
-    "github": {"icon": "⚙️", "label": "GitHub"},
-    "youtube": {"icon": "▶️", "label": "YouTube"},
-    "instagram_reels": {"icon": "📸", "label": "Instagram"},
-    "tiktok": {"icon": "🎵", "label": "TikTok"},
+SOURCE_MAP = {
+    "arxiv": {"icon": "📄", "name": "ArXiv"},
+    "producthunt": {"icon": "🐱", "name": "Product Hunt"},
+    "github": {"icon": "⚙️", "name": "GitHub"},
+    "youtube": {"icon": "▶️", "name": "YouTube"},
+    "instagram_reels": {"icon": "📸", "name": "Instagram"},
+    "tiktok": {"icon": "🎵", "name": "TikTok"},
 }
 
 
-def _rss_label(source: str) -> dict:
-    feed_name = source.replace("rss_", "").replace("_", " ").title()
-    return {"icon": "📰", "label": feed_name}
+def _source_meta(source: str) -> dict:
+    if source in SOURCE_MAP:
+        return SOURCE_MAP[source]
+    if source.startswith("rss_"):
+        name = source.replace("rss_", "").replace("_", " ").title()
+        return {"icon": "📰", "name": name}
+    return {"icon": "📡", "name": source or "feed"}
 
 
 def build_card(item: dict) -> str:
     cat = item.get("category", "MARKET_NEWS")
-    source = item.get("source", "rss")
+    source = item.get("source", "")
     url = (item.get("url") or "").strip()
-    title = (item.get("title") or "")[:200]
-    summary = (item.get("summary_es") or "")[:400]
+    title = (item.get("title") or "")[:100]
+    summary = (item.get("summary_es") or "")[:280]
+    score_raw = item.get("relevance_score", 0)
+    try:
+        score = int(score_raw)
+    except (TypeError, ValueError):
+        score = 0
 
-    cat_info = CATEGORY_META.get(cat, {"emoji": "✨", "label": "Inteligencia artificial"})
-    src_info = SOURCE_META.get(source) or _rss_label(source)
+    cat_info = CATEGORY_MAP.get(cat, {"emoji": "📌", "label": "NEWS"})
+    src_info = _source_meta(source)
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d · %H:%M UTC")
 
     t_esc = html_escape(title, quote=False)
     s_esc = html_escape(summary, quote=False)
-    cat_lbl = html_escape(cat_info["label"], quote=False)
-    src_lbl = html_escape(src_info["label"], quote=False)
+    lbl_esc = html_escape(cat_info["label"], quote=False)
+    src_esc = html_escape(src_info["name"], quote=False)
 
-    # Cabecera de marca: compacta, sin reglas ni líneas decorativas
-    header = (
-        f"<b>PULSO IA</b>  <code>{html_escape(now_str, quote=False)}</code>\n"
-        f"<i>Selección diaria de IA</i>"
-    )
-
-    # Categoría como “chip” textual (Telegram no permite fondos)
-    badge = f"{cat_info['emoji']}  <b>{cat_lbl}</b>"
-
-    # Cuerpo: título dominante + resumen con aire
-    body = f"<b>{t_esc}</b>\n\n{s_esc}"
-
-    # Pie: fuente + CTA (preview del enlace aporta imagen si el sitio la define)
+    pre_header = html_escape(f"Selección IA · readout\n{now_str}", quote=False)
+    parts = [
+        "<b>◉ PULSO IA</b>",
+        f"<pre>{pre_header}</pre>",
+        "",
+        f"{cat_info['emoji']}  <b><code>{lbl_esc}</code></b>",
+        "",
+        f"<b>{t_esc}</b>",
+        "",
+        s_esc,
+        "",
+        f"{src_info['icon']} <i>{src_esc}</i>  ·  relevancia <code>{score}</code>",
+    ]
     if url:
-        footer = (
-            f"{src_info['icon']} <i>{src_lbl}</i>\n"
-            f"<a href=\"{html_escape(url, quote=True)}\">Abrir noticia completa →</a>"
+        parts.extend(
+            [
+                "",
+                f"<a href=\"{html_escape(url, quote=True)}\">Leer más ↗</a>",
+            ]
         )
-    else:
-        footer = f"{src_info['icon']} <i>{src_lbl}</i>"
 
-    return f"{header}\n\n{badge}\n\n{body}\n\n{footer}"
+    return "\n".join(parts)
+
+
+def _plain_fallback(item: dict) -> str:
+    cat_info = CATEGORY_MAP.get(item.get("category", ""), {"emoji": "📌", "label": "NEWS"})
+    return (
+        f"◉ PULSO IA\n"
+        f"{cat_info['emoji']} {cat_info['label']}\n\n"
+        f"{(item.get('title') or '')[:100]}\n\n"
+        f"{(item.get('summary_es') or '')[:280]}\n\n"
+        f"{item.get('url', '')}"
+    )
 
 
 def get_bot_token() -> str:
@@ -90,26 +110,47 @@ def get_bot_token() -> str:
     )["Parameter"]["Value"]
 
 
-def send_card(token: str, item: dict, attempt: int = 0) -> dict | None:
+def send_card(
+    token: str,
+    item: dict,
+    keyboard: dict | None = None,
+    attempt: int = 0,
+) -> dict | None:
+    payload = {
+        "chat_id": CHANNEL_ID,
+        "text": build_card(item),
+        "parse_mode": "HTML",
+        "disable_web_page_preview": False,
+    }
+    if keyboard:
+        payload["reply_markup"] = keyboard
+
     resp = requests.post(
         f"https://api.telegram.org/bot{token}/sendMessage",
-        json={
-            "chat_id": CHANNEL_ID,
-            "text": build_card(item),
-            "parse_mode": "HTML",
-            "disable_web_page_preview": False,
-        },
+        json=payload,
         timeout=15,
     )
 
     if resp.status_code == 429 and attempt < 3:
         retry_after = resp.json().get("parameters", {}).get("retry_after", 5)
-        logger.warning("Rate limited waiting %ss", retry_after)
         time.sleep(retry_after)
-        return send_card(token, item, attempt + 1)
+        return send_card(token, item, keyboard, attempt + 1)
 
     if not resp.ok:
-        logger.error("Telegram error %s: %s", resp.status_code, resp.text[:300])
+        logger.error("Telegram HTML error %s: %s", resp.status_code, resp.text[:300])
+        if resp.status_code == 400 and "parse" in resp.text.lower() and attempt == 0:
+            logger.warning("HTML parse error — retrying as plain text")
+            resp2 = requests.post(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                json={
+                    "chat_id": CHANNEL_ID,
+                    "text": _plain_fallback(item),
+                    "disable_web_page_preview": False,
+                    **({"reply_markup": keyboard} if keyboard else {}),
+                },
+                timeout=15,
+            )
+            return resp2.json().get("result") if resp2.ok else None
         return None
 
     return resp.json().get("result")
