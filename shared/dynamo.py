@@ -34,14 +34,29 @@ def batch_save_items(items: List[ProcessedNewsItem]):
         for item in items:
             batch.put_item(Item=item.__dict__)
 
-def mark_as_sent(item_id: str, message_id: int | None = None):
-    """Marca item como publicado en Telegram."""
+def mark_as_sent(
+    item_id: str,
+    message_id: int | None = None,
+    read_slug: str | None = None,
+):
+    """Marca item como publicado; read_slug = path corto /p/{slug} en API propia."""
     if message_id is not None:
-        table.update_item(
-            Key={"item_id": item_id},
-            UpdateExpression="SET telegram_sent = :t, telegram_message_id = :mid",
-            ExpressionAttributeValues={":t": "true", ":mid": message_id},
-        )
+        if read_slug:
+            table.update_item(
+                Key={"item_id": item_id},
+                UpdateExpression="SET telegram_sent = :t, telegram_message_id = :mid, read_slug = :slug REMOVE read_short_url",
+                ExpressionAttributeValues={
+                    ":t": "true",
+                    ":mid": message_id,
+                    ":slug": read_slug,
+                },
+            )
+        else:
+            table.update_item(
+                Key={"item_id": item_id},
+                UpdateExpression="SET telegram_sent = :t, telegram_message_id = :mid",
+                ExpressionAttributeValues={":t": "true", ":mid": message_id},
+            )
     else:
         table.update_item(
             Key={"item_id": item_id},

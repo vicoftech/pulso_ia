@@ -2,13 +2,18 @@
 import json
 import logging
 import os
+import re
+import secrets
+import string
 import sys
 import time
 from datetime import datetime, timezone
 from html import escape as html_escape
+from html import unescape as html_unescape
 
 import boto3
 import requests
+from botocore.exceptions import ClientError
 
 _pkg = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _pkg)
@@ -22,6 +27,14 @@ logger = logging.getLogger()
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 
 CHANNEL_ID = os.environ["TELEGRAM_CHANNEL_ID"]
+PUBLIC_LINK_BASE = (
+    os.environ.get("PUBLIC_LINK_BASE") or os.environ.get("PUBLIC_API_BASE") or ""
+).rstrip("/")
+SHORT_LINKS_TABLE = os.environ["SHORT_LINKS_TABLE"]
+_region = os.environ.get("AWS_REGION", "us-east-1")
+
+_slug_alphabet = string.ascii_letters + string.digits
+_short_links = boto3.resource("dynamodb", region_name=_region).Table(SHORT_LINKS_TABLE)
 
 CATEGORY_MAP = {
     "NEW_PRODUCT": {"emoji": "🚀", "label": "NEW PRODUCT"},
@@ -74,7 +87,6 @@ def build_publication_queue(relevant_items: list[dict]) -> list[dict]:
 def build_card(item: dict) -> str:
     cat = item.get("category", "MARKET_NEWS")
     source = item.get("source", "")
-    url = (item.get("url") or "").strip()
     title = (item.get("title") or "")[:100]
     summary = (item.get("summary_es") or "")[:280]
     score_raw = item.get("relevance_score", 0)
@@ -105,15 +117,53 @@ def build_card(item: dict) -> str:
         "",
         f"{src_info['icon']} <i>{src_esc}</i>  ·  relevancia <code>{score}</code>",
     ]
-    if url:
-        parts.extend(
-            [
-                "",
-                f"<a href=\"{html_escape(url, quote=True)}\">Leer más ↗</a>",
-            ]
-        )
 
     return "\n".join(parts)
+
+
+def _article_read_url(item_id: str) -> str:
+    if not PUBLIC_LINK_BASE:
+        raise RuntimeError("PUBLIC_LINK_BASE is not set")
+    return f"{PUBLIC_LINK_BASE}/r/{item_id}"
+
+
+def _public_p_url(slug: str) -> str:
+    return f"{PUBLIC_LINK_BASE}/p/{slug}"
+
+
+def _allocate_slug(item_id: str) -> str:
+    ttl = int(time.time()) + 86400 * 120
+    for _ in range(16):
+        slug = "".join(secrets.choice(_slug_alphabet) for _ in range(8))
+        try:
+            _short_links.put_item(
+                Item={"slug": slug, "item_id": item_id, "ttl": ttl},
+                ConditionExpression="attribute_not_exists(#s)",
+                ExpressionAttributeNames={"#s": "slug"},
+            )
+            return slug
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                continue
+            raise
+    raise RuntimeError("No se pudo generar slug único")
+
+
+def build_inline_keyboard(
+    item_id: str,
+    like_count: int = 0,
+    read_button_url: str | None = None,
+) -> dict:
+    read_u = (read_button_url or "").strip() or _article_read_url(item_id)
+    like_label = f"👍 {like_count}"
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "📖 Leer artículo", "url": read_u},
+                {"text": like_label, "callback_data": f"like:{item_id}"},
+            ]
+        ]
+    }
 
 
 def _plain_fallback(item: dict) -> str:
@@ -122,8 +172,7 @@ def _plain_fallback(item: dict) -> str:
         f"◉ PULSO IA\n"
         f"{cat_info['emoji']} {cat_info['label']}\n\n"
         f"{(item.get('title') or '')[:100]}\n\n"
-        f"{(item.get('summary_es') or '')[:280]}\n\n"
-        f"{item.get('url', '')}"
+        f"{(item.get('summary_es') or '')[:280]}"
     )
 
 
@@ -134,50 +183,177 @@ def get_bot_token() -> str:
     )["Parameter"]["Value"]
 
 
-def send_card(
-    token: str,
-    item: dict,
-    keyboard: dict | None = None,
-    attempt: int = 0,
+_OG_IMAGE_PATTERNS = (
+    re.compile(
+        r'<meta\s+[^>]*property\s*=\s*["\']og:image["\'][^>]*content\s*=\s*["\']([^"\']+)["\']',
+        re.I,
+    ),
+    re.compile(
+        r'<meta\s+[^>]*content\s*=\s*["\']([^"\']+)["\'][^>]*property\s*=\s*["\']og:image["\']',
+        re.I,
+    ),
+    re.compile(
+        r'<meta\s+[^>]*name\s*=\s*["\']twitter:image["\'][^>]*content\s*=\s*["\']([^"\']+)["\']',
+        re.I,
+    ),
+    re.compile(
+        r'<meta\s+[^>]*name\s*=\s*["\']twitter:image:src["\'][^>]*content\s*=\s*["\']([^"\']+)["\']',
+        re.I,
+    ),
+)
+
+
+def _extract_og_image_url(html: str) -> str | None:
+    for pat in _OG_IMAGE_PATTERNS:
+        m = pat.search(html)
+        if not m:
+            continue
+        raw = html_unescape(m.group(1).strip())
+        if raw.startswith(("https://", "http://")):
+            return raw
+    return None
+
+
+def _fetch_article_preview_image(article_url: str) -> str | None:
+    try:
+        r = requests.get(
+            article_url,
+            timeout=(3, 6),
+            headers={
+                "User-Agent": "Mozilla/5.0 (compatible; PulsoIA/1.0; +https://workium.ai)",
+                "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
+            },
+            allow_redirects=True,
+        )
+    except (requests.RequestException, OSError) as e:
+        logger.info("og:image fetch skip: %s", e)
+        return None
+    if r.status_code != 200 or not r.text:
+        return None
+    snippet = r.text[:900_000]
+    return _extract_og_image_url(snippet)
+
+
+def _send_message_no_preview(
+    token: str, text: str, keyboard: dict | None, plain: bool
 ) -> dict | None:
-    payload = {
+    payload: dict = {
         "chat_id": CHANNEL_ID,
-        "text": build_card(item),
-        "parse_mode": "HTML",
-        "disable_web_page_preview": False,
+        "text": text,
+        "disable_web_page_preview": True,
     }
+    if not plain:
+        payload["parse_mode"] = "HTML"
     if keyboard:
         payload["reply_markup"] = keyboard
-
     resp = requests.post(
         f"https://api.telegram.org/bot{token}/sendMessage",
         json=payload,
         timeout=15,
     )
+    return resp.json().get("result") if resp.ok else None
 
-    if resp.status_code == 429 and attempt < 3:
-        retry_after = resp.json().get("parameters", {}).get("retry_after", 5)
-        time.sleep(retry_after)
-        return send_card(token, item, keyboard, attempt + 1)
 
-    if not resp.ok:
-        logger.error("Telegram HTML error %s: %s", resp.status_code, resp.text[:300])
-        if resp.status_code == 400 and "parse" in resp.text.lower() and attempt == 0:
-            logger.warning("HTML parse error — retrying as plain text")
-            resp2 = requests.post(
-                f"https://api.telegram.org/bot{token}/sendMessage",
-                json={
-                    "chat_id": CHANNEL_ID,
-                    "text": _plain_fallback(item),
-                    "disable_web_page_preview": False,
-                    **({"reply_markup": keyboard} if keyboard else {}),
-                },
-                timeout=15,
+_MAX_CAPTION = 1024
+
+
+def _telegram_caption(html: str) -> str:
+    if len(html) <= _MAX_CAPTION:
+        return html
+    return html[: _MAX_CAPTION - 1] + "…"
+
+
+def send_card(
+    token: str,
+    item: dict,
+    keyboard: dict | None = None,
+) -> dict | None:
+    article_url = (item.get("url") or "").strip()
+    card_html = build_card(item)
+    photo_url: str | None = None
+    if article_url.lower().startswith(("http://", "https://")):
+        photo_url = _fetch_article_preview_image(article_url)
+
+    if photo_url:
+        caption = _telegram_caption(card_html)
+        p_payload: dict = {
+            "chat_id": CHANNEL_ID,
+            "photo": photo_url,
+            "caption": caption,
+            "parse_mode": "HTML",
+        }
+        if keyboard:
+            p_payload["reply_markup"] = keyboard
+        for _ in range(4):
+            resp = requests.post(
+                f"https://api.telegram.org/bot{token}/sendPhoto",
+                json=p_payload,
+                timeout=25,
             )
-            return resp2.json().get("result") if resp2.ok else None
+            if resp.ok:
+                return resp.json().get("result")
+            if resp.status_code == 429:
+                retry_after = resp.json().get("parameters", {}).get("retry_after", 5)
+                time.sleep(retry_after)
+                continue
+            logger.warning(
+                "sendPhoto falló (%s), texto sin preview: %s",
+                resp.status_code,
+                (resp.text or "")[:250],
+            )
+            break
+
+    payload: dict = {
+        "chat_id": CHANNEL_ID,
+        "text": card_html,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    if keyboard:
+        payload["reply_markup"] = keyboard
+
+    for _ in range(4):
+        resp = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json=payload,
+            timeout=15,
+        )
+        if resp.ok:
+            return resp.json().get("result")
+        if resp.status_code == 429:
+            retry_after = resp.json().get("parameters", {}).get("retry_after", 5)
+            time.sleep(retry_after)
+            continue
+        err_txt = resp.text or ""
+        logger.error("Telegram error %s: %s", resp.status_code, err_txt[:400])
+        if resp.status_code == 400 and "parse" in err_txt.lower():
+            logger.warning("HTML parse error — retrying as plain text")
+            plain_text = _plain_fallback(item)
+            if photo_url:
+                cap = _telegram_caption(plain_text)
+                for _ in range(4):
+                    resp_p = requests.post(
+                        f"https://api.telegram.org/bot{token}/sendPhoto",
+                        json={
+                            "chat_id": CHANNEL_ID,
+                            "photo": photo_url,
+                            "caption": cap,
+                            "reply_markup": keyboard,
+                        },
+                        timeout=25,
+                    )
+                    if resp_p.ok:
+                        return resp_p.json().get("result")
+                    if resp_p.status_code == 429:
+                        time.sleep(
+                            resp_p.json().get("parameters", {}).get("retry_after", 5)
+                        )
+                        continue
+                    break
+            return _send_message_no_preview(token, plain_text, keyboard, plain=True)
         return None
 
-    return resp.json().get("result")
+    return None
 
 
 def handler(event, context):
@@ -196,22 +372,29 @@ def handler(event, context):
 
     to_send = combined[0]
     remainder = combined[1:]
-    queued_remaining = len(remainder)
 
     token = get_bot_token()
     sent = 0
     failed = 0
 
     try:
-        result = send_card(token, to_send)
+        item_id = to_send["item_id"]
+        slug = _allocate_slug(item_id)
+        read_btn = _public_p_url(slug)
+        keyboard = build_inline_keyboard(item_id, 0, read_button_url=read_btn)
+        result = send_card(token, to_send, keyboard)
         if result:
             mid = result.get("message_id")
-            mark_as_sent(to_send["item_id"], mid)
+            mark_as_sent(item_id, mid, read_slug=slug)
             sent = 1
             for it in remainder:
                 if it.get("telegram_sent") not in ("queued", "true"):
                     mark_as_queued(it["item_id"])
         else:
+            try:
+                _short_links.delete_item(Key={"slug": slug})
+            except Exception:
+                pass
             failed = 1
     except Exception as e:
         failed = 1
