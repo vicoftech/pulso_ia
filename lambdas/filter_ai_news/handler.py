@@ -23,6 +23,55 @@ THRESHOLD = int(os.environ.get("RELEVANCE_THRESHOLD", "60"))
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "20"))
 bedrock = boto3.client("bedrock-runtime")
 
+SUBCATEGORY_CATALOG = {
+    "NEW_PRODUCT": [
+        "Productivity Tools",
+        "Developer Tools",
+        "Enterprise SaaS",
+        "Creative Tools",
+        "Education",
+        "Security",
+        "Otros",
+    ],
+    "MODEL_UPDATE": [
+        "New Model Release",
+        "Capability Upgrade",
+        "Pricing Update",
+        "Context Window",
+        "Multimodal Update",
+        "Open Source Release",
+        "Otros",
+    ],
+    "METHODOLOGY": [
+        "Research Paper",
+        "Benchmark",
+        "Training Technique",
+        "Inference Optimization",
+        "Evaluation Method",
+        "Alignment and Safety",
+        "Otros",
+    ],
+    "MARKET_NEWS": [
+        "Funding",
+        "M&A",
+        "Partnership",
+        "Regulation",
+        "Legal",
+        "Ecosystem Shift",
+        "Otros",
+    ],
+    "USE_CASE": [
+        "Healthcare",
+        "Finance",
+        "Retail and E-commerce",
+        "Manufacturing",
+        "Public Sector",
+        "Customer Support",
+        "Otros",
+    ],
+    "UNCATEGORIZED": ["Otros"],
+}
+
 SYSTEM_PROMPT = """You are the AI curator for "Pulso IA", a premium Telegram channel.
 Analyze news items and classify them strictly. Only truly relevant AI news passes.
 
@@ -33,7 +82,25 @@ Categories:
 - MARKET_NEWS: Acquisitions, funding, major launches, regulatory news, significant failures
 - USE_CASE: Novel applications of AI in specific domains
 
+Subcategory catalog (must pick one from the selected category, otherwise use "Otros"):
+- NEW_PRODUCT: Productivity Tools, Developer Tools, Enterprise SaaS, Creative Tools, Education, Security, Otros
+- MODEL_UPDATE: New Model Release, Capability Upgrade, Pricing Update, Context Window, Multimodal Update, Open Source Release, Otros
+- METHODOLOGY: Research Paper, Benchmark, Training Technique, Inference Optimization, Evaluation Method, Alignment and Safety, Otros
+- MARKET_NEWS: Funding, M&A, Partnership, Regulation, Legal, Ecosystem Shift, Otros
+- USE_CASE: Healthcare, Finance, Retail and E-commerce, Manufacturing, Public Sector, Customer Support, Otros
+
 Respond ONLY with a valid JSON array. No markdown, no explanation, no preamble."""
+
+
+def _normalize_subcategory(category: str, subcategory: str | None) -> str:
+    allowed = SUBCATEGORY_CATALOG.get(category, SUBCATEGORY_CATALOG["UNCATEGORIZED"])
+    raw = (subcategory or "").strip()
+    if not raw:
+        return "Otros"
+    for opt in allowed:
+        if raw.lower() == opt.lower():
+            return opt
+    return "Otros"
 
 def classify_batch(items: list) -> list:
     simplified = [{"item_id": i["item_id"], "title": i["title"],
@@ -43,6 +110,7 @@ def classify_batch(items: list) -> list:
         'Return format per item:\n'
         '{"item_id":"...","is_ai_related":true/false,"is_relevant":true/false,'
         '"category":"NEW_PRODUCT|MODEL_UPDATE|METHODOLOGY|MARKET_NEWS|USE_CASE|null",'
+        '"subcategory":"short specific subcategory in English (2-4 words) or null",'
         '"relevance_score":0-100,'
         '"summary_es":"resumen en espanol, maximo 280 caracteres, directo y sin rodeos"}'
     )
@@ -95,6 +163,10 @@ def handler(event, context):
                 processed_at=now,
                 is_relevant=cl.get("is_relevant", False),
                 relevance_score=cl.get("relevance_score", 0),
+                subcategory=_normalize_subcategory(
+                    cl.get("category") or "UNCATEGORIZED",
+                    cl.get("subcategory"),
+                ),
             )
             prev = preserved_sent.get(cl["item_id"], "false")
             if prev in ("queued", "true"):

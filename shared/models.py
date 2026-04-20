@@ -27,5 +27,6 @@ class ProcessedNewsItem:
     processed_at: str
     is_relevant: bool
     relevance_score: int
+    subcategory: str = ""
     telegram_sent: str = "false"
     ttl: int = field(default_factory=lambda: int(time.time()) + 2592000)

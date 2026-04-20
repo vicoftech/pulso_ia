@@ -1,5 +1,6 @@
 # shared/dynamo.py
 import boto3
+from datetime import datetime, timezone
 import os
 from decimal import Decimal
 from typing import List
@@ -40,28 +41,30 @@ def mark_as_sent(
     read_slug: str | None = None,
 ):
     """Marca item como publicado; read_slug = path corto /p/{slug} en API propia."""
+    sent_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     if message_id is not None:
         if read_slug:
             table.update_item(
                 Key={"item_id": item_id},
-                UpdateExpression="SET telegram_sent = :t, telegram_message_id = :mid, read_slug = :slug REMOVE read_short_url",
+                UpdateExpression="SET telegram_sent = :t, telegram_message_id = :mid, read_slug = :slug, sent_at = :sent_at REMOVE read_short_url",
                 ExpressionAttributeValues={
                     ":t": "true",
                     ":mid": message_id,
                     ":slug": read_slug,
+                    ":sent_at": sent_at,
                 },
             )
         else:
             table.update_item(
                 Key={"item_id": item_id},
-                UpdateExpression="SET telegram_sent = :t, telegram_message_id = :mid",
-                ExpressionAttributeValues={":t": "true", ":mid": message_id},
+                UpdateExpression="SET telegram_sent = :t, telegram_message_id = :mid, sent_at = :sent_at",
+                ExpressionAttributeValues={":t": "true", ":mid": message_id, ":sent_at": sent_at},
             )
     else:
         table.update_item(
             Key={"item_id": item_id},
-            UpdateExpression="SET telegram_sent = :val",
-            ExpressionAttributeValues={":val": "true"},
+            UpdateExpression="SET telegram_sent = :val, sent_at = :sent_at",
+            ExpressionAttributeValues={":val": "true", ":sent_at": sent_at},
         )
 
 

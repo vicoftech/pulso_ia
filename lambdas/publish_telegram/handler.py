@@ -31,10 +31,14 @@ PUBLIC_LINK_BASE = (
     os.environ.get("PUBLIC_LINK_BASE") or os.environ.get("PUBLIC_API_BASE") or ""
 ).rstrip("/")
 SHORT_LINKS_TABLE = os.environ["SHORT_LINKS_TABLE"]
+ITEMS_TABLE = os.environ["DYNAMODB_TABLE"]
 _region = os.environ.get("AWS_REGION", "us-east-1")
+DAILY_SUMMARY_HOUR_UTC = int(os.environ.get("DAILY_SUMMARY_HOUR_UTC", "23"))
+SUMMARY_MAX_ITEMS = int(os.environ.get("DAILY_SUMMARY_MAX_ITEMS", "30"))
 
 _slug_alphabet = string.ascii_letters + string.digits
 _short_links = boto3.resource("dynamodb", region_name=_region).Table(SHORT_LINKS_TABLE)
+_items = boto3.resource("dynamodb", region_name=_region).Table(ITEMS_TABLE)
 
 CATEGORY_MAP = {
     "NEW_PRODUCT": {"emoji": "🚀", "label": "NEW PRODUCT"},
@@ -86,6 +90,7 @@ def build_publication_queue(relevant_items: list[dict]) -> list[dict]:
 
 def build_card(item: dict) -> str:
     cat = item.get("category", "MARKET_NEWS")
+    subcat = (item.get("subcategory") or "").strip()[:40] or "Otros"
     source = item.get("source", "")
     title = (item.get("title") or "")[:100]
     summary = (item.get("summary_es") or "")[:280]
@@ -102,6 +107,7 @@ def build_card(item: dict) -> str:
     t_esc = html_escape(title, quote=False)
     s_esc = html_escape(summary, quote=False)
     lbl_esc = html_escape(cat_info["label"], quote=False)
+    subcat_esc = html_escape(subcat, quote=False)
     src_esc = html_escape(src_info["name"], quote=False)
 
     pre_header = html_escape(f"Selección IA · readout\n{now_str}", quote=False)
@@ -110,6 +116,7 @@ def build_card(item: dict) -> str:
         f"<pre>{pre_header}</pre>",
         "",
         f"{cat_info['emoji']}  <b><code>{lbl_esc}</code></b>",
+        f"↳ <i>{subcat_esc or 'General'}</i>",
         "",
         f"<b>{t_esc}</b>",
         "",
@@ -168,9 +175,10 @@ def build_inline_keyboard(
 
 def _plain_fallback(item: dict) -> str:
     cat_info = CATEGORY_MAP.get(item.get("category", ""), {"emoji": "📌", "label": "NEWS"})
+    subcat = (item.get("subcategory") or "Otros")[:40]
     return (
         f"◉ PULSO IA\n"
-        f"{cat_info['emoji']} {cat_info['label']}\n\n"
+        f"{cat_info['emoji']} {cat_info['label']} · {subcat}\n\n"
         f"{(item.get('title') or '')[:100]}\n\n"
         f"{(item.get('summary_es') or '')[:280]}"
     )
@@ -356,12 +364,100 @@ def send_card(
     return None
 
 
+def _day_from_iso(s: str) -> str:
+    if not s:
+        return ""
+    return s[:10]
+
+
+def _summary_url(item: dict) -> str:
+    slug = (item.get("read_slug") or "").strip()
+    if slug:
+        return _public_p_url(slug)
+    return _article_read_url(item.get("item_id", ""))
+
+
+def _build_daily_summary_card(day: str, rows: list[dict]) -> str:
+    grouped: dict[tuple[str, str], list[dict]] = {}
+    for it in rows:
+        cat = it.get("category") or "UNCATEGORIZED"
+        subcat = (it.get("subcategory") or "Otros").strip()[:40]
+        grouped.setdefault((cat, subcat), []).append(it)
+
+    parts = [
+        "<b>◉ PULSO IA · Resumen diario</b>",
+        f"<pre>{day} · UTC</pre>",
+        "",
+    ]
+    shown = 0
+    for (cat, subcat), items in sorted(grouped.items(), key=lambda x: (x[0][0], x[0][1])):
+        if shown >= SUMMARY_MAX_ITEMS:
+            break
+        cat_info = CATEGORY_MAP.get(cat, {"emoji": "📌", "label": "NEWS"})
+        parts.append(f"{cat_info['emoji']} <b>{html_escape(cat_info['label'], quote=False)}</b> · <i>{html_escape(subcat, quote=False)}</i>")
+        for it in items:
+            if shown >= SUMMARY_MAX_ITEMS:
+                break
+            title = html_escape((it.get("title") or "Sin título")[:90], quote=False)
+            url = html_escape(_summary_url(it), quote=True)
+            parts.append(f"• <a href=\"{url}\">{title}</a> <i>({html_escape(subcat, quote=False)})</i>")
+            shown += 1
+        parts.append("")
+    if len(rows) > shown:
+        parts.append(f"… y {len(rows) - shown} más.")
+    return "\n".join(parts)
+
+
+def _mark_summary_sent(items: list[dict], day: str) -> None:
+    for it in items:
+        iid = (it.get("item_id") or "").strip()
+        if not iid:
+            continue
+        _items.update_item(
+            Key={"item_id": iid},
+            UpdateExpression="SET daily_summary_date = :d",
+            ExpressionAttributeValues={":d": day},
+        )
+
+
+def _maybe_send_daily_summary(token: str) -> bool:
+    now = datetime.now(timezone.utc)
+    if now.hour < DAILY_SUMMARY_HOUR_UTC:
+        return False
+    day = now.strftime("%Y-%m-%d")
+    sent_items = query_by_telegram_status("true")
+    pending = []
+    for it in sent_items:
+        sent_day = _day_from_iso(it.get("sent_at") or "")
+        processed_day = _day_from_iso(it.get("processed_at") or "")
+        is_today = (sent_day == day) or (not sent_day and processed_day == day)
+        if is_today and (it.get("daily_summary_date") or "") != day:
+            pending.append(it)
+    if not pending:
+        return False
+
+    pending_sorted = sorted(pending, key=lambda x: (x.get("sent_at") or "", x.get("item_id") or ""))
+    summary = _build_daily_summary_card(day, pending_sorted)
+    resp = requests.post(
+        f"https://api.telegram.org/bot{token}/sendMessage",
+        json={"chat_id": CHANNEL_ID, "text": summary, "parse_mode": "HTML", "disable_web_page_preview": True},
+        timeout=20,
+    )
+    if resp.ok:
+        _mark_summary_sent(pending_sorted, day)
+        return True
+    logger.warning("daily summary failed: %s %s", resp.status_code, (resp.text or "")[:300])
+    return False
+
+
 def handler(event, context):
     relevant_items = event.get("relevant_items") or []
 
     combined = build_publication_queue(relevant_items)
     if not combined:
         logger.info("Empty publication queue (no queued items and no new relevant)")
+        token = get_bot_token()
+        _maybe_send_daily_summary(token)
         return {
             "published": 0,
             "sent": 0,
@@ -411,6 +507,8 @@ def handler(event, context):
             }
         )
     )
+    if sent and len(remainder) == 0:
+        _maybe_send_daily_summary(token)
 
     return {
         "published": sent,
