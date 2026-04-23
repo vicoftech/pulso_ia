@@ -11,16 +11,13 @@ terraform {
       version = "~> 2.4"
     }
   }
-
-  # Estado remoto S3: añadí dentro de este bloque terraform { ... }:
-  #   backend "s3" {}
-  # y ejecutá terraform init -backend-config=backend.hcl (-migrate-state si venís de state local).
-  # Ver backend.hcl.example. Sin ese bloque, el state es local (útil para import en una máquina nueva).
 }
 
 provider "aws" {
   region = var.aws_region
 }
+
+data "aws_caller_identity" "current" {}
 
 variable "aws_region" {
   default = "us-east-1"
@@ -38,32 +35,26 @@ variable "relevance_threshold" {
   default = "60"
 }
 
-variable "pipeline_schedule_expression" {
-  description = "Cadencia entre barridos del pipeline (EventBridge Scheduler). Por defecto 15 minutos."
-  type        = string
-  default     = "rate(15 minutes)"
-}
-
 variable "telegram_channel_id" {
   default = "-1003846999541"
 }
 
-variable "link_public_base_url" {
-  description = <<-EOT
-    Base HTTPS pública: enlaces en botones (/p/, /r/) y, si aplicas certificado, el mismo host en API Gateway.
-    Ej.: https://news.workium.ai — debe coincidir con el nombre del certificado ACM.
-  EOT
+# URL del servicio de redirección para contar clics (botón «Leer más»); p. ej. news.workium.ai
+variable "outbound_tracking_base" {
   type    = string
   default = "https://news.workium.ai"
 }
 
-variable "api_gateway_custom_domain_certificate_arn" {
-  description = <<-EOT
-    ARN del certificado ACM en la MISMA región que el API (p. ej. us-east-1) para el host de link_public_base_url
-    (news.workium.ai o *.workium.ai). Vacío = sin dominio custom; usá el endpoint execute-api y un CNAME manual si querés.
-  EOT
+# Prefijo de path antes del item_id, p. ej. /r → https://host/r/<item_id>
+variable "outbound_tracking_path" {
   type    = string
-  default = ""
+  default = "/r"
+}
+
+# Query param (Workium: url)
+variable "outbound_tracking_query_param" {
+  type    = string
+  default = "url"
 }
 
 locals {
@@ -95,6 +86,11 @@ resource "aws_dynamodb_table" "items" {
     type = "S"
   }
 
+  attribute {
+    name = "outbox_key"
+    type = "S"
+  }
+
   ttl {
     attribute_name = "ttl"
     enabled        = true
@@ -107,56 +103,33 @@ resource "aws_dynamodb_table" "items" {
     projection_type = "ALL"
   }
 
+  global_secondary_index {
+    name            = "outbox_key-processed_at-index"
+    hash_key        = "outbox_key"
+    range_key       = "processed_at"
+    projection_type = "ALL"
+  }
+
   tags = {
     Project = var.project_name
   }
 }
 
-resource "aws_dynamodb_table" "events" {
-  name         = "${var.project_name}-events"
+# Eventos de engagement: aperturas (open) y me gusta (like) para análisis
+resource "aws_dynamodb_table" "engagement" {
+  name         = "${var.project_name}_engagement"
   billing_mode = "PAY_PER_REQUEST"
-  hash_key     = "event_id"
+  hash_key     = "item_id"
+  range_key    = "event_sk"
 
-  attribute {
-    name = "event_id"
-    type = "S"
-  }
   attribute {
     name = "item_id"
     type = "S"
   }
-  attribute {
-    name = "user_id"
-    type = "S"
-  }
-  attribute {
-    name = "event_name"
-    type = "S"
-  }
-  attribute {
-    name = "occurred_at"
-    type = "S"
-  }
 
-  global_secondary_index {
-    name            = "user_id-occurred_at-index"
-    hash_key        = "user_id"
-    range_key       = "occurred_at"
-    projection_type = "ALL"
-  }
-
-  global_secondary_index {
-    name            = "item_id-occurred_at-index"
-    hash_key        = "item_id"
-    range_key       = "occurred_at"
-    projection_type = "ALL"
-  }
-
-  global_secondary_index {
-    name            = "event_name-occurred_at-index"
-    hash_key        = "event_name"
-    range_key       = "occurred_at"
-    projection_type = "ALL"
+  attribute {
+    name = "event_sk"
+    type = "S"
   }
 
   ttl {
@@ -169,19 +142,15 @@ resource "aws_dynamodb_table" "events" {
   }
 }
 
-resource "aws_dynamodb_table" "short_links" {
-  name         = "${var.project_name}-short-links"
+# Contador de me gusta por post (etiqueta del botón; dedup múltiples taps = mismo criterio de analytics)
+resource "aws_dynamodb_table" "like_counts" {
+  name         = "${var.project_name}_like_counts"
   billing_mode = "PAY_PER_REQUEST"
-  hash_key     = "slug"
+  hash_key     = "item_id"
 
   attribute {
-    name = "slug"
+    name = "item_id"
     type = "S"
-  }
-
-  ttl {
-    attribute_name = "ttl"
-    enabled        = true
   }
 
   tags = {
@@ -215,6 +184,41 @@ resource "aws_iam_role" "publish" {
   assume_role_policy = data.aws_iam_policy_document.lambda_assume.json
 }
 
+resource "aws_iam_role" "telegram_engagement" {
+  name               = "${var.project_name}-telegram-engagement-role"
+  assume_role_policy = data.aws_iam_policy_document.lambda_assume.json
+}
+
+resource "aws_iam_role_policy" "telegram_engagement_policy" {
+  role = aws_iam_role.telegram_engagement.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["dynamodb:PutItem"]
+        Resource = [aws_dynamodb_table.engagement.arn]
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["dynamodb:UpdateItem", "dynamodb:GetItem"]
+        Resource = [aws_dynamodb_table.like_counts.arn]
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["ssm:GetParameter"]
+        Resource = "arn:aws:ssm:${var.aws_region}:*:parameter/pulso-ia/telegram-bot-token"
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
+        Resource = "*"
+      }
+    ]
+  })
+}
+
 resource "aws_iam_role_policy" "fetch_policy" {
   role = aws_iam_role.fetch.id
 
@@ -222,18 +226,18 @@ resource "aws_iam_role_policy" "fetch_policy" {
     Version = "2012-10-17"
     Statement = [
       {
-        Effect   = "Allow"
-        Action   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:BatchGetItem", "dynamodb:BatchWriteItem"]
+        Effect = "Allow"
+        Action = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:BatchGetItem", "dynamodb:BatchWriteItem"]
         Resource = aws_dynamodb_table.items.arn
       },
       {
-        Effect   = "Allow"
-        Action   = ["ssm:GetParameter"]
+        Effect = "Allow"
+        Action = ["ssm:GetParameter"]
         Resource = "arn:aws:ssm:${var.aws_region}:*:parameter/pulso-ia/*"
       },
       {
-        Effect   = "Allow"
-        Action   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
+        Effect = "Allow"
+        Action = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
         Resource = "*"
       }
     ]
@@ -247,18 +251,18 @@ resource "aws_iam_role_policy" "filter_policy" {
     Version = "2012-10-17"
     Statement = [
       {
-        Effect   = "Allow"
-        Action   = ["dynamodb:PutItem", "dynamodb:BatchWriteItem", "dynamodb:BatchGetItem"]
+        Effect = "Allow"
+        Action = ["dynamodb:PutItem", "dynamodb:BatchWriteItem"]
         Resource = aws_dynamodb_table.items.arn
       },
       {
-        Effect   = "Allow"
-        Action   = ["bedrock:InvokeModel"]
+        Effect = "Allow"
+        Action = ["bedrock:InvokeModel"]
         Resource = "*"
       },
       {
-        Effect   = "Allow"
-        Action   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
+        Effect = "Allow"
+        Action = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
         Resource = "*"
       }
     ]
@@ -272,42 +276,33 @@ resource "aws_iam_role_policy" "publish_policy" {
     Version = "2012-10-17"
     Statement = [
       {
-        Effect   = "Allow"
-        Action   = ["dynamodb:UpdateItem", "dynamodb:Query"]
+        Effect = "Allow"
+        Action = ["dynamodb:UpdateItem", "dynamodb:Query"]
         Resource = [aws_dynamodb_table.items.arn, "${aws_dynamodb_table.items.arn}/index/*"]
       },
       {
-        Effect   = "Allow"
-        Action   = ["dynamodb:PutItem", "dynamodb:DeleteItem"]
-        Resource = aws_dynamodb_table.short_links.arn
+        Effect = "Allow"
+        Action = ["dynamodb:GetItem"]
+        Resource = [aws_dynamodb_table.like_counts.arn]
       },
       {
-        Effect   = "Allow"
-        Action   = ["ssm:GetParameter"]
+        Effect = "Allow"
+        Action = ["ssm:GetParameter"]
         Resource = "arn:aws:ssm:${var.aws_region}:*:parameter/pulso-ia/*"
       },
       {
-        Effect   = "Allow"
-        Action   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
+        Effect = "Allow"
+        Action = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
         Resource = "*"
       }
     ]
   })
 }
 
-# Lambda Python layers must use python/lib/<runtime>/site-packages/ so imports resolve.
 data "archive_file" "shared_layer" {
   type        = "zip"
+  source_dir  = "${path.module}/../shared"
   output_path = "${path.module}/../dist/shared_layer.zip"
-
-  source {
-    content  = file("${path.module}/../shared/dynamo.py")
-    filename = "python/lib/python3.12/site-packages/dynamo.py"
-  }
-  source {
-    content  = file("${path.module}/../shared/models.py")
-    filename = "python/lib/python3.12/site-packages/models.py"
-  }
 }
 
 resource "aws_lambda_layer_version" "shared" {
@@ -365,6 +360,78 @@ resource "aws_lambda_function" "filter" {
   }
 }
 
+data "archive_file" "telegram_engagement" {
+  type        = "zip"
+  source_dir  = "${path.module}/../lambdas/telegram_engagement"
+  output_path = "${path.module}/../dist/telegram_engagement.zip"
+}
+
+resource "aws_lambda_function" "telegram_engagement" {
+  filename         = data.archive_file.telegram_engagement.output_path
+  function_name    = "${var.project_name}-telegram-engagement"
+  role             = aws_iam_role.telegram_engagement.arn
+  handler          = "handler.handler"
+  runtime          = "python3.12"
+  timeout          = 20
+  memory_size      = 128
+  source_code_hash = data.archive_file.telegram_engagement.output_base64sha256
+  layers           = [aws_lambda_layer_version.shared.arn]
+
+  environment {
+    variables = {
+      DYNAMODB_ENGAGEMENT_TABLE     = aws_dynamodb_table.engagement.name
+      DYNAMODB_LIKE_COUNTS_TABLE      = aws_dynamodb_table.like_counts.name
+      LOG_LEVEL                       = "INFO"
+      PULSO_OUTBOUND_TRACKING_BASE    = var.outbound_tracking_base
+      PULSO_OUTBOUND_TRACKING_PATH    = var.outbound_tracking_path
+      PULSO_OUTBOUND_QUERY_PARAM      = var.outbound_tracking_query_param
+    }
+  }
+}
+
+resource "aws_apigatewayv2_api" "engagement" {
+  name          = "${var.project_name}-engagement"
+  protocol_type = "HTTP"
+}
+
+resource "aws_apigatewayv2_stage" "engagement" {
+  api_id      = aws_apigatewayv2_api.engagement.id
+  name        = "$default"
+  auto_deploy = true
+}
+
+resource "aws_apigatewayv2_integration" "engagement" {
+  api_id                 = aws_apigatewayv2_api.engagement.id
+  integration_type       = "AWS_PROXY"
+  integration_uri        = aws_lambda_function.telegram_engagement.invoke_arn
+  payload_format_version = "2.0"
+}
+
+resource "aws_apigatewayv2_route" "engagement_get_c" {
+  api_id    = aws_apigatewayv2_api.engagement.id
+  route_key = "GET /c"
+  target    = "integrations/${aws_apigatewayv2_integration.engagement.id}"
+}
+
+resource "aws_apigatewayv2_route" "engagement_post_webhook" {
+  api_id    = aws_apigatewayv2_api.engagement.id
+  route_key = "POST /webhook/telegram"
+  target    = "integrations/${aws_apigatewayv2_integration.engagement.id}"
+}
+
+resource "aws_lambda_permission" "apigw_invoke_telegram_engagement" {
+  statement_id  = "AllowAPIGWInvoke"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.telegram_engagement.function_name
+  principal     = "apigateway.amazonaws.com"
+  source_arn    = "arn:aws:execute-api:${var.aws_region}:${data.aws_caller_identity.current.account_id}:${aws_apigatewayv2_api.engagement.id}/*/*"
+}
+
+resource "aws_cloudwatch_log_group" "telegram_engagement" {
+  name              = "/aws/lambda/${aws_lambda_function.telegram_engagement.function_name}"
+  retention_in_days = 7
+}
+
 data "archive_file" "publish" {
   type        = "zip"
   source_dir  = "${path.module}/../lambdas/publish_telegram"
@@ -382,11 +449,70 @@ resource "aws_lambda_function" "publish" {
   source_code_hash = data.archive_file.publish.output_base64sha256
   layers           = [aws_lambda_layer_version.shared.arn]
 
+  # Botón «Leer más» → solo news.workium.ai?url=… (no execute-api; opcional: setear PULSO_OPEN_TRACKER_URL a mano)
+  environment {
+    variables = merge(local.common_env, {
+      TELEGRAM_CHANNEL_ID         = var.telegram_channel_id
+      TIMEZONE                    = "America/Argentina/Buenos_Aires"
+      PULSO_OUTBOUND_TRACKING_BASE  = var.outbound_tracking_base
+      PULSO_OUTBOUND_TRACKING_PATH  = var.outbound_tracking_path
+      PULSO_OUTBOUND_QUERY_PARAM    = var.outbound_tracking_query_param
+      DYNAMODB_LIKE_COUNTS_TABLE     = aws_dynamodb_table.like_counts.name
+    })
+  }
+}
+
+resource "aws_iam_role" "evening" {
+  name               = "${var.project_name}-evening-role"
+  assume_role_policy = data.aws_iam_policy_document.lambda_assume.json
+}
+
+resource "aws_iam_role_policy" "evening_policy" {
+  role = aws_iam_role.evening.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["dynamodb:Query"]
+        Resource = [aws_dynamodb_table.items.arn, "${aws_dynamodb_table.items.arn}/index/*"]
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["ssm:GetParameter"]
+        Resource = "arn:aws:ssm:${var.aws_region}:*:parameter/pulso-ia/telegram-bot-token"
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
+        Resource = "*"
+      }
+    ]
+  })
+}
+
+data "archive_file" "evening" {
+  type        = "zip"
+  source_dir  = "${path.module}/../lambdas/evening_summary"
+  output_path = "${path.module}/../dist/evening_summary.zip"
+}
+
+resource "aws_lambda_function" "evening" {
+  filename         = data.archive_file.evening.output_path
+  function_name    = "${var.project_name}-evening-summary"
+  role             = aws_iam_role.evening.arn
+  handler          = "handler.handler"
+  runtime          = "python3.12"
+  timeout          = 60
+  memory_size      = 256
+  source_code_hash = data.archive_file.evening.output_base64sha256
+  layers           = [aws_lambda_layer_version.shared.arn]
+
   environment {
     variables = merge(local.common_env, {
       TELEGRAM_CHANNEL_ID = var.telegram_channel_id
-      PUBLIC_LINK_BASE    = local.link_public_base
-      SHORT_LINKS_TABLE   = aws_dynamodb_table.short_links.name
+      TIMEZONE            = "America/Argentina/Buenos_Aires"
     })
   }
 }
@@ -430,7 +556,7 @@ resource "aws_iam_role_policy" "sfn_policy" {
     Statement = [{
       Effect   = "Allow"
       Action   = ["lambda:InvokeFunction"]
-      Resource = [aws_lambda_function.fetch.arn, aws_lambda_function.filter.arn, aws_lambda_function.publish.arn]
+      Resource = [aws_lambda_function.fetch.arn, aws_lambda_function.filter.arn]
     }]
   })
 }
@@ -461,36 +587,19 @@ resource "aws_sfn_state_machine" "pipeline" {
           NumericGreaterThan = 0
           Next               = "FilterAINews"
         }]
-        Default = "QueueDrainOnly"
-      }
-      QueueDrainOnly = {
-        Type       = "Pass"
-        Result = {
-          relevant_items  = []
-          total_processed = 0
-          total_relevant  = 0
-          by_category     = {}
-        }
-        ResultPath = "$.filter_result"
-        Next       = "PublishTelegram"
+        Default = "Done"
       }
       FilterAINews = {
         Type       = "Task"
         Resource   = aws_lambda_function.filter.arn
         InputPath  = "$.fetch_result"
         ResultPath = "$.filter_result"
-        Next       = "PublishTelegram"
+        Next       = "Done"
         Retry = [{
           ErrorEquals     = ["States.TaskFailed"]
           MaxAttempts     = 2
           IntervalSeconds = 30
         }]
-      }
-      PublishTelegram = {
-        Type      = "Task"
-        Resource  = aws_lambda_function.publish.arn
-        InputPath = "$.filter_result"
-        Next      = "Done"
       }
       Done = {
         Type = "Succeed"
@@ -535,7 +644,7 @@ resource "aws_scheduler_schedule" "hourly" {
     mode = "OFF"
   }
 
-  schedule_expression = var.pipeline_schedule_expression
+  schedule_expression = "rate(1 hour)"
 
   target {
     arn      = aws_sfn_state_machine.pipeline.arn
@@ -548,148 +657,74 @@ resource "aws_scheduler_schedule" "hourly" {
   }
 }
 
-data "archive_file" "engagement" {
-  type        = "zip"
-  source_dir  = "${path.module}/../lambdas/engagement_handler"
-  output_path = "${path.module}/../dist/engagement_handler.zip"
+resource "aws_iam_role" "scheduler_lambdas" {
+  name               = "${var.project_name}-scheduler-lambdas"
+  assume_role_policy = data.aws_iam_policy_document.scheduler_assume.json
 }
 
-resource "aws_iam_role" "engagement" {
-  name               = "${var.project_name}-engagement-role"
-  assume_role_policy = data.aws_iam_policy_document.lambda_assume.json
-}
+resource "aws_iam_role_policy" "scheduler_lambdas_policy" {
+  role = aws_iam_role.scheduler_lambdas.id
 
-resource "aws_iam_role_policy_attachment" "engagement_basic" {
-  role       = aws_iam_role.engagement.name
-  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
-}
-
-resource "aws_iam_role_policy" "engagement_policy" {
-  role = aws_iam_role.engagement.id
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [
-      {
-        Effect = "Allow"
-        Action = ["dynamodb:GetItem", "dynamodb:Query"]
-        Resource = [
-          aws_dynamodb_table.items.arn,
-          "${aws_dynamodb_table.items.arn}/index/*",
-          aws_dynamodb_table.short_links.arn,
-        ]
-      },
-      {
-        Effect = "Allow"
-        Action = ["dynamodb:PutItem", "dynamodb:Query"]
-        Resource = [
-          aws_dynamodb_table.events.arn,
-          "${aws_dynamodb_table.events.arn}/index/*",
-        ]
-      },
-      {
-        Effect   = "Allow"
-        Action   = ["ssm:GetParameter"]
-        Resource = "arn:aws:ssm:${var.aws_region}:*:parameter/pulso-ia/*"
-      }
-    ]
+    Statement = [{
+      Effect   = "Allow"
+      Action   = "lambda:InvokeFunction"
+      Resource = [aws_lambda_function.publish.arn, aws_lambda_function.evening.arn]
+    }]
   })
 }
 
-resource "aws_lambda_function" "engagement" {
-  filename         = data.archive_file.engagement.output_path
-  function_name    = "${var.project_name}-engagement-handler"
-  role             = aws_iam_role.engagement.arn
-  handler          = "handler.handler"
-  runtime          = "python3.12"
-  timeout          = 30
-  memory_size      = 128
-  source_code_hash = data.archive_file.engagement.output_base64sha256
-  environment {
-    variables = {
-      DYNAMODB_TABLE    = aws_dynamodb_table.items.name
-      EVENTS_TABLE      = aws_dynamodb_table.events.name
-      SHORT_LINKS_TABLE = aws_dynamodb_table.short_links.name
-      LOG_LEVEL         = "INFO"
-      PUBLIC_LINK_BASE  = local.link_public_base
-    }
+resource "aws_scheduler_schedule" "publish_ticker" {
+  name = "${var.project_name}-publish-ticker"
+
+  flexible_time_window {
+    mode = "OFF"
+  }
+
+  schedule_expression = "rate(15 minutes)"
+
+  target {
+    arn      = aws_lambda_function.publish.arn
+    role_arn = aws_iam_role.scheduler_lambdas.arn
   }
 }
 
-resource "aws_cloudwatch_log_group" "engagement" {
-  name              = "/aws/lambda/${aws_lambda_function.engagement.function_name}"
-  retention_in_days = 7
+resource "aws_scheduler_schedule" "evening" {
+  name = "${var.project_name}-evening-ar"
+
+  flexible_time_window {
+    mode = "OFF"
+  }
+
+  schedule_expression          = "cron(0 21 * * ? *)"
+  schedule_expression_timezone = "America/Argentina/Buenos_Aires"
+
+  target {
+    arn      = aws_lambda_function.evening.arn
+    role_arn = aws_iam_role.scheduler_lambdas.arn
+  }
 }
 
-resource "aws_apigatewayv2_api" "webhook" {
-  name          = "${var.project_name}-webhook"
-  protocol_type = "HTTP"
-}
-
-locals {
-  public_api_base        = trimsuffix(aws_apigatewayv2_api.webhook.api_endpoint, "/")
-  link_public_base       = trimsuffix(var.link_public_base_url, "/")
-  custom_domain_hostname = replace(replace(trim(var.link_public_base_url, "/"), "https://", ""), "http://", "")
-}
-
-resource "aws_apigatewayv2_integration" "engagement" {
-  api_id                 = aws_apigatewayv2_api.webhook.id
-  integration_type       = "AWS_PROXY"
-  integration_uri        = aws_lambda_function.engagement.invoke_arn
-  payload_format_version = "2.0"
-}
-
-resource "aws_apigatewayv2_route" "webhook" {
-  api_id    = aws_apigatewayv2_api.webhook.id
-  route_key = "POST /webhook"
-  target    = "integrations/${aws_apigatewayv2_integration.engagement.id}"
-}
-
-resource "aws_apigatewayv2_route" "article_redirect" {
-  api_id    = aws_apigatewayv2_api.webhook.id
-  route_key = "GET /r/{item_id}"
-  target    = "integrations/${aws_apigatewayv2_integration.engagement.id}"
-}
-
-resource "aws_apigatewayv2_route" "short_redirect" {
-  api_id    = aws_apigatewayv2_api.webhook.id
-  route_key = "GET /p/{slug}"
-  target    = "integrations/${aws_apigatewayv2_integration.engagement.id}"
-}
-
-resource "aws_apigatewayv2_stage" "webhook_default" {
-  api_id      = aws_apigatewayv2_api.webhook.id
-  name        = "$default"
-  auto_deploy = true
-}
-
-resource "aws_lambda_permission" "apigw_engagement" {
-  statement_id  = "AllowAPIGatewayEngagement"
+resource "aws_lambda_permission" "allow_scheduler_publish" {
+  statement_id  = "AllowExecutionFromEventBridgeSchedulerPublish"
   action        = "lambda:InvokeFunction"
-  function_name = aws_lambda_function.engagement.function_name
-  principal     = "apigateway.amazonaws.com"
-  source_arn    = "${aws_apigatewayv2_api.webhook.execution_arn}/*/*"
+  function_name = aws_lambda_function.publish.function_name
+  principal     = "scheduler.amazonaws.com"
+  source_arn    = aws_scheduler_schedule.publish_ticker.arn
 }
 
-resource "aws_apigatewayv2_domain_name" "public" {
-  count       = var.api_gateway_custom_domain_certificate_arn != "" ? 1 : 0
-  domain_name = local.custom_domain_hostname
-
-  domain_name_configuration {
-    certificate_arn = var.api_gateway_custom_domain_certificate_arn
-    endpoint_type   = "REGIONAL"
-    security_policy = "TLS_1_2"
-  }
-
-  tags = {
-    Project = var.project_name
-  }
+resource "aws_lambda_permission" "allow_scheduler_evening" {
+  statement_id  = "AllowExecutionFromEventBridgeSchedulerEvening"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.evening.function_name
+  principal     = "scheduler.amazonaws.com"
+  source_arn    = aws_scheduler_schedule.evening.arn
 }
 
-resource "aws_apigatewayv2_api_mapping" "public" {
-  count       = var.api_gateway_custom_domain_certificate_arn != "" ? 1 : 0
-  api_id      = aws_apigatewayv2_api.webhook.id
-  domain_name = aws_apigatewayv2_domain_name.public[0].id
-  stage       = aws_apigatewayv2_stage.webhook_default.name
+resource "aws_cloudwatch_log_group" "evening" {
+  name              = "/aws/lambda/${aws_lambda_function.evening.function_name}"
+  retention_in_days = 7
 }
 
 output "state_machine_arn" {
@@ -700,47 +735,15 @@ output "dynamodb_table" {
   value = aws_dynamodb_table.items.name
 }
 
-output "events_table" {
-  value = aws_dynamodb_table.events.name
+output "dynamodb_engagement_table" {
+  value = aws_dynamodb_table.engagement.name
 }
 
-output "webhook_url" {
-  value       = "${local.public_api_base}/webhook"
-  description = "URL del API real (execute-api). Sirve siempre; usala para setWebhook si el dominio custom aún no resuelve."
+# Base de la API HTTP (registrar webhook: POST /webhook/telegram)
+output "engagement_api_base" {
+  value = aws_apigatewayv2_api.engagement.api_endpoint
 }
 
-output "webhook_url_custom_domain" {
-  value       = var.api_gateway_custom_domain_certificate_arn != "" ? "${local.link_public_base}/webhook" : null
-  description = "https://news.workium.ai/webhook (solo si creaste dominio custom en Terraform). Registrá esta URL en Telegram cuando el DNS ya apunte bien."
-}
-
-output "api_gateway_base" {
-  value       = local.public_api_base
-  description = "Host real de API Gateway (webhook y pruebas hasta mapear dominio)."
-}
-
-output "article_redirect_base" {
-  value = "${local.link_public_base}/r/"
-}
-
-output "short_link_base" {
-  value = "${local.link_public_base}/p/"
-}
-
-output "link_public_base" {
-  value = local.link_public_base
-}
-
-output "short_links_table" {
-  value = aws_dynamodb_table.short_links.name
-}
-
-output "custom_domain_target_domain" {
-  value       = try(aws_apigatewayv2_domain_name.public[0].domain_name_configuration[0].target_domain_name, null)
-  description = "Valor CNAME: apuntá news.workium.ai → este host (regional execute-api)."
-}
-
-output "custom_domain_hosted_zone_id" {
-  value       = try(aws_apigatewayv2_domain_name.public[0].domain_name_configuration[0].hosted_zone_id, null)
-  description = "Hosted zone ID de API Gateway (solo si usás alias Route53 en vez de CNAME)."
+output "telegram_webhook_url" {
+  value = "${trimsuffix(aws_apigatewayv2_api.engagement.api_endpoint, "/")}/webhook/telegram"
 }

@@ -2,518 +2,290 @@
 import json
 import logging
 import os
-import re
-import secrets
-import string
 import sys
 import time
-from datetime import datetime, timezone
-from html import escape as html_escape
-from html import unescape as html_unescape
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import boto3
 import requests
-from botocore.exceptions import ClientError
 
 _pkg = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, _pkg)
-_shared = os.path.normpath(os.path.join(_pkg, "..", "..", "shared"))
-if os.path.isdir(_shared):
-    sys.path.insert(0, _shared)
+if _pkg not in sys.path:
+    sys.path.insert(0, _pkg)
+_sh = os.path.join(_pkg, "../../shared")
+if os.path.isfile(os.path.join(_sh, "dynamo.py")) and _sh not in sys.path:
+    sys.path.insert(0, _sh)
 
-from dynamo import mark_as_queued, mark_as_sent, query_by_telegram_status
+from dynamo import get_latest_sent_item, get_oldest_queued_item, mark_as_sent
+from like_counts import get_count as get_like_count
+from og_image import extract_og_image_url
+from outbound_url import build_open_and_track_url
 
 logger = logging.getLogger()
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
-
 CHANNEL_ID = os.environ["TELEGRAM_CHANNEL_ID"]
-PUBLIC_LINK_BASE = (
-    os.environ.get("PUBLIC_LINK_BASE") or os.environ.get("PUBLIC_API_BASE") or ""
-).rstrip("/")
-SHORT_LINKS_TABLE = os.environ["SHORT_LINKS_TABLE"]
-ITEMS_TABLE = os.environ["DYNAMODB_TABLE"]
-_region = os.environ.get("AWS_REGION", "us-east-1")
-DAILY_SUMMARY_HOUR_UTC = int(os.environ.get("DAILY_SUMMARY_HOUR_UTC", "23"))
-SUMMARY_MAX_ITEMS = int(os.environ.get("DAILY_SUMMARY_MAX_ITEMS", "30"))
+TZ = os.environ.get("TIMEZONE", "America/Argentina/Buenos_Aires")
 
-_slug_alphabet = string.ascii_letters + string.digits
-_short_links = boto3.resource("dynamodb", region_name=_region).Table(SHORT_LINKS_TABLE)
-_items = boto3.resource("dynamodb", region_name=_region).Table(ITEMS_TABLE)
-
-CATEGORY_MAP = {
-    "NEW_PRODUCT": {"emoji": "🚀", "label": "NEW PRODUCT"},
-    "MODEL_UPDATE": {"emoji": "⚡", "label": "MODEL UPDATE"},
-    "METHODOLOGY": {"emoji": "🧠", "label": "METHODOLOGY"},
-    "MARKET_NEWS": {"emoji": "📊", "label": "MARKET NEWS"},
-    "USE_CASE": {"emoji": "💡", "label": "USE CASE"},
-    "VIDEO_EXPLAINER": {"emoji": "🎬", "label": "VIDEO"},
-    "UNCATEGORIZED": {"emoji": "📌", "label": "NEWS"},
+CATEGORY_META = {
+    "NEW_PRODUCT":  {"emoji": "🚀", "tag": "#NuevoProducto"},
+    "MODEL_UPDATE": {"emoji": "⚡", "tag": "#ActualizaciónIA"},
+    "METHODOLOGY":  {"emoji": "🧠", "tag": "#MetodologíaIA"},
+    "MARKET_NEWS":  {"emoji": "📊", "tag": "#NoticiasIA"},
+    "USE_CASE":     {"emoji": "💡", "tag": "#CasosDeUso"},
+}
+SOURCE_TAGS = {
+    "arxiv": "#ArXiv",
+    "producthunt": "#ProductHunt",
+    "github": "#GitHub",
+}
+# Nombre de categoría para lectura (Categoría / Subcategoría en el card)
+CATEGORY_LABEL_ES = {
+    "NEW_PRODUCT": "Nuevo producto",
+    "MODEL_UPDATE": "Actualización de modelo o versión",
+    "METHODOLOGY": "Metodología, papers y técnicas",
+    "MARKET_NEWS": "Mercado, inversión y regulación",
+    "USE_CASE": "Caso de uso y aplicación",
+    "UNCATEGORIZED": "Sin clasificar",
 }
 
-SOURCE_MAP = {
-    "arxiv": {"icon": "📄", "name": "ArXiv"},
-    "producthunt": {"icon": "🐱", "name": "Product Hunt"},
-    "github": {"icon": "⚙️", "name": "GitHub"},
-    "youtube": {"icon": "▶️", "name": "YouTube"},
-    "instagram_reels": {"icon": "📸", "name": "Instagram"},
-    "tiktok": {"icon": "🎵", "name": "TikTok"},
-}
+def get_bot_token() -> str:
+    ssm = boto3.client("ssm")
+    return ssm.get_parameter(
+        Name="/pulso-ia/telegram-bot-token", WithDecryption=True
+    )["Parameter"]["Value"]
+
+def escape_md2(text: str) -> str:
+    special = r"_*[]()~`>#+-=|{}.!"
+    return "".join(f"\\{c}" if c in special else c for c in text)
 
 
-def _source_meta(source: str) -> dict:
-    if source in SOURCE_MAP:
-        return SOURCE_MAP[source]
-    if source.startswith("rss_"):
-        name = source.replace("rss_", "").replace("_", " ").title()
-        return {"icon": "📰", "name": name}
-    return {"icon": "📡", "name": source or "feed"}
+def _category_label_es(category: str) -> str:
+    c = (category or "").strip() or "USE_CASE"
+    return CATEGORY_LABEL_ES.get(
+        c, c.replace("_", " ").title() if c else "Sin clasificar"
+    )
 
 
-def _published_at_sort_key(item: dict) -> str:
-    return (item.get("published_at") or "")[:32]
+def _source_data_label(source: str) -> str:
+    s = (source or "").strip()
+    if s == "arxiv":
+        return "ArXiv"
+    if s == "producthunt":
+        return "Product Hunt"
+    if s == "github":
+        return "GitHub"
+    if s.startswith("rss_"):
+        tail = s[4:].replace("_", " ").strip()
+        return f"RSS · {tail}" if tail else "RSS"
+    return s or "—"
 
 
-def build_publication_queue(relevant_items: list[dict]) -> list[dict]:
-    """
-    Orden: primero ítems ya en cola (telegram_sent=queued), luego los nuevos del barrido,
-    cada bloque ordenado por published_at ascendente (la menos reciente = más antigua primero).
-    """
-    backlog = query_by_telegram_status("queued")
-    backlog_ids = {x["item_id"] for x in backlog}
-    backlog_sorted = sorted(backlog, key=_published_at_sort_key)
-
-    new_items = [dict(i) for i in relevant_items if i.get("item_id") not in backlog_ids]
-    new_sorted = sorted(new_items, key=_published_at_sort_key)
-
-    return backlog_sorted + new_sorted
-
-
-def build_card(item: dict) -> str:
-    cat = item.get("category", "MARKET_NEWS")
-    subcat = (item.get("subcategory") or "").strip()[:40] or "Otros"
-    source = item.get("source", "")
-    title = (item.get("title") or "")[:100]
-    summary = (item.get("summary_es") or "")[:280]
-    score_raw = item.get("relevance_score", 0)
+def _relevance_line(item: dict) -> str:
+    v = item.get("relevance_score", 0)
     try:
-        score = int(score_raw)
+        n = int(v)  # int o Decimal luego de _normalize
     except (TypeError, ValueError):
-        score = 0
-
-    cat_info = CATEGORY_MAP.get(cat, {"emoji": "📌", "label": "NEWS"})
-    src_info = _source_meta(source)
-    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d · %H:%M UTC")
-
-    t_esc = html_escape(title, quote=False)
-    s_esc = html_escape(summary, quote=False)
-    lbl_esc = html_escape(cat_info["label"], quote=False)
-    subcat_esc = html_escape(subcat, quote=False)
-    src_esc = html_escape(src_info["name"], quote=False)
-
-    pre_header = html_escape(f"Selección IA · readout\n{now_str}", quote=False)
-    parts = [
-        "<b>◉ PULSO IA</b>",
-        f"<pre>{pre_header}</pre>",
-        "",
-        f"{cat_info['emoji']}  <b><code>{lbl_esc}</code></b>",
-        f"↳ <i>{subcat_esc or 'General'}</i>",
-        "",
-        f"<b>{t_esc}</b>",
-        "",
-        s_esc,
-        "",
-        f"{src_info['icon']} <i>{src_esc}</i>  ·  relevancia <code>{score}</code>",
-    ]
-
-    return "\n".join(parts)
+        n = 0
+    n = max(0, min(100, n))
+    return f"{n}/100"
 
 
-def _article_read_url(item_id: str) -> str:
-    if not PUBLIC_LINK_BASE:
-        raise RuntimeError("PUBLIC_LINK_BASE is not set")
-    return f"{PUBLIC_LINK_BASE}/r/{item_id}"
-
-
-def _public_p_url(slug: str) -> str:
-    return f"{PUBLIC_LINK_BASE}/p/{slug}"
-
-
-def _allocate_slug(item_id: str) -> str:
-    ttl = int(time.time()) + 86400 * 120
-    for _ in range(16):
-        slug = "".join(secrets.choice(_slug_alphabet) for _ in range(8))
-        try:
-            _short_links.put_item(
-                Item={"slug": slug, "item_id": item_id, "ttl": ttl},
-                ConditionExpression="attribute_not_exists(#s)",
-                ExpressionAttributeNames={"#s": "slug"},
-            )
-            return slug
-        except ClientError as e:
-            if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
-                continue
-            raise
-    raise RuntimeError("No se pudo generar slug único")
-
-
-def build_inline_keyboard(
-    item_id: str,
-    like_count: int = 0,
-    read_button_url: str | None = None,
-) -> dict:
-    read_u = (read_button_url or "").strip() or _article_read_url(item_id)
-    like_label = f"👍 {like_count}"
+def _inline_keyboard(item: dict) -> dict:
+    """Leer más: /c + Workium; me gusta: callback → contador (Dynamo) + webhook (evento)."""
+    url = (item.get("url") or "").strip()[:2000]
+    if not url:
+        return {}
+    iid = (item.get("item_id") or "")[:50]
+    url = build_open_and_track_url(iid, url)
+    # callback_data: máx 64 bytes (Telegram) — el número va solo en el texto del botón
+    cb = f"like:{iid}" if iid else "like:unknown"
+    if len(cb.encode("utf-8")) > 64:
+        cb = cb[:64]
+    n = get_like_count(iid) if iid and iid != "unknown" else 0
+    like_label = f"👍 {n}" if n else "👍 0"
     return {
         "inline_keyboard": [
             [
-                {"text": "📖 Leer artículo", "url": read_u},
-                {"text": like_label, "callback_data": f"like:{item_id}"},
+                {"text": "🔗 Leer más", "url": url},
+                {"text": like_label, "callback_data": cb},
             ]
         ]
     }
 
 
-def _plain_fallback(item: dict) -> str:
-    cat_info = CATEGORY_MAP.get(item.get("category", ""), {"emoji": "📌", "label": "NEWS"})
-    subcat = (item.get("subcategory") or "Otros")[:40]
-    return (
-        f"◉ PULSO IA\n"
-        f"{cat_info['emoji']} {cat_info['label']} · {subcat}\n\n"
-        f"{(item.get('title') or '')[:100]}\n\n"
-        f"{(item.get('summary_es') or '')[:280]}"
-    )
+def _caption_under_telegram_limit(item: dict, max_len: int = 1000) -> str:
+    """Límite sendPhoto: caption 1024; dejamos margen y acortamos el resumen."""
+    summary_full = (item.get("summary_es") or "")
+    for n in (min(len(summary_full), 500), 400, 300, 220, 160, 100, 60):
+        it = {**item, "summary_es": summary_full[:n] + ("…" if len(summary_full) > n else "")}
+        t = format_message(it)
+        if len(t) <= max_len:
+            return t
+    it = {**item, "summary_es": (summary_full[:30] + "…") if summary_full else ""}
+    return format_message(it)[:max_len]
 
 
-def get_bot_token() -> str:
-    ssm = boto3.client("ssm", region_name=os.environ.get("AWS_REGION", "us-east-1"))
-    return ssm.get_parameter(
-        Name="/pulso-ia/telegram-bot-token", WithDecryption=True
-    )["Parameter"]["Value"]
-
-
-_OG_IMAGE_PATTERNS = (
-    re.compile(
-        r'<meta\s+[^>]*property\s*=\s*["\']og:image["\'][^>]*content\s*=\s*["\']([^"\']+)["\']',
-        re.I,
-    ),
-    re.compile(
-        r'<meta\s+[^>]*content\s*=\s*["\']([^"\']+)["\'][^>]*property\s*=\s*["\']og:image["\']',
-        re.I,
-    ),
-    re.compile(
-        r'<meta\s+[^>]*name\s*=\s*["\']twitter:image["\'][^>]*content\s*=\s*["\']([^"\']+)["\']',
-        re.I,
-    ),
-    re.compile(
-        r'<meta\s+[^>]*name\s*=\s*["\']twitter:image:src["\'][^>]*content\s*=\s*["\']([^"\']+)["\']',
-        re.I,
-    ),
-)
-
-
-def _extract_og_image_url(html: str) -> str | None:
-    for pat in _OG_IMAGE_PATTERNS:
-        m = pat.search(html)
-        if not m:
-            continue
-        raw = html_unescape(m.group(1).strip())
-        if raw.startswith(("https://", "http://")):
-            return raw
-    return None
-
-
-def _fetch_article_preview_image(article_url: str) -> str | None:
-    try:
-        r = requests.get(
-            article_url,
-            timeout=(3, 6),
-            headers={
-                "User-Agent": "Mozilla/5.0 (compatible; PulsoIA/1.0; +https://workium.ai)",
-                "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
-            },
-            allow_redirects=True,
-        )
-    except (requests.RequestException, OSError) as e:
-        logger.info("og:image fetch skip: %s", e)
+def resolve_hero_image_url(item: dict) -> str | None:
+    u = (item.get("image_url") or "").strip() if item.get("image_url") else ""
+    if u.startswith("http://") or u.startswith("https://"):
+        return u[:2000]
+    page = (item.get("url") or "").strip()
+    if not page.startswith("http://") and not page.startswith("https://"):
         return None
-    if r.status_code != 200 or not r.text:
-        return None
-    snippet = r.text[:900_000]
-    return _extract_og_image_url(snippet)
+    got = extract_og_image_url(page, timeout=8.0)
+    return (got or "")[:2000] or None
 
 
-def _send_message_no_preview(
-    token: str, text: str, keyboard: dict | None, plain: bool
-) -> dict | None:
+def send_message(
+    token: str, text: str, item: dict | None = None, max_retries: int = 3
+) -> bool:
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload: dict = {
         "chat_id": CHANNEL_ID,
         "text": text,
-        "disable_web_page_preview": True,
+        "parse_mode": "MarkdownV2",
+        "disable_web_page_preview": False,
     }
-    if not plain:
-        payload["parse_mode"] = "HTML"
-    if keyboard:
-        payload["reply_markup"] = keyboard
-    resp = requests.post(
-        f"https://api.telegram.org/bot{token}/sendMessage",
-        json=payload,
-        timeout=15,
-    )
-    return resp.json().get("result") if resp.ok else None
-
-
-_MAX_CAPTION = 1024
-
-
-def _telegram_caption(html: str) -> str:
-    if len(html) <= _MAX_CAPTION:
-        return html
-    return html[: _MAX_CAPTION - 1] + "…"
-
-
-def send_card(
-    token: str,
-    item: dict,
-    keyboard: dict | None = None,
-) -> dict | None:
-    article_url = (item.get("url") or "").strip()
-    card_html = build_card(item)
-    photo_url: str | None = None
-    if article_url.lower().startswith(("http://", "https://")):
-        photo_url = _fetch_article_preview_image(article_url)
-
-    if photo_url:
-        caption = _telegram_caption(card_html)
-        p_payload: dict = {
-            "chat_id": CHANNEL_ID,
-            "photo": photo_url,
-            "caption": caption,
-            "parse_mode": "HTML",
-        }
-        if keyboard:
-            p_payload["reply_markup"] = keyboard
-        for _ in range(4):
-            resp = requests.post(
-                f"https://api.telegram.org/bot{token}/sendPhoto",
-                json=p_payload,
-                timeout=25,
-            )
-            if resp.ok:
-                return resp.json().get("result")
-            if resp.status_code == 429:
-                retry_after = resp.json().get("parameters", {}).get("retry_after", 5)
-                time.sleep(retry_after)
-                continue
-            logger.warning(
-                "sendPhoto falló (%s), texto sin preview: %s",
-                resp.status_code,
-                (resp.text or "")[:250],
-            )
-            break
-
-    payload: dict = {
-        "chat_id": CHANNEL_ID,
-        "text": card_html,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    }
-    if keyboard:
-        payload["reply_markup"] = keyboard
-
-    for _ in range(4):
+    if item:
+        mark = _inline_keyboard(item)
+        if mark:
+            payload["reply_markup"] = mark
+    for attempt in range(max_retries):
         resp = requests.post(
-            f"https://api.telegram.org/bot{token}/sendMessage",
+            url,
             json=payload,
-            timeout=15,
+            timeout=10,
         )
-        if resp.ok:
-            return resp.json().get("result")
+        data = resp.json()
+        if data.get("ok"):
+            return True
         if resp.status_code == 429:
-            retry_after = resp.json().get("parameters", {}).get("retry_after", 5)
+            retry_after = data.get("parameters", {}).get("retry_after", 5)
             time.sleep(retry_after)
-            continue
-        err_txt = resp.text or ""
-        logger.error("Telegram error %s: %s", resp.status_code, err_txt[:400])
-        if resp.status_code == 400 and "parse" in err_txt.lower():
-            logger.warning("HTML parse error — retrying as plain text")
-            plain_text = _plain_fallback(item)
-            if photo_url:
-                cap = _telegram_caption(plain_text)
-                for _ in range(4):
-                    resp_p = requests.post(
-                        f"https://api.telegram.org/bot{token}/sendPhoto",
-                        json={
-                            "chat_id": CHANNEL_ID,
-                            "photo": photo_url,
-                            "caption": cap,
-                            "reply_markup": keyboard,
-                        },
-                        timeout=25,
-                    )
-                    if resp_p.ok:
-                        return resp_p.json().get("result")
-                    if resp_p.status_code == 429:
-                        time.sleep(
-                            resp_p.json().get("parameters", {}).get("retry_after", 5)
-                        )
-                        continue
-                    break
-            return _send_message_no_preview(token, plain_text, keyboard, plain=True)
-        return None
-
-    return None
-
-
-def _day_from_iso(s: str) -> str:
-    if not s:
-        return ""
-    return s[:10]
-
-
-def _summary_url(item: dict) -> str:
-    slug = (item.get("read_slug") or "").strip()
-    if slug:
-        return _public_p_url(slug)
-    return _article_read_url(item.get("item_id", ""))
-
-
-def _build_daily_summary_card(day: str, rows: list[dict]) -> str:
-    grouped: dict[tuple[str, str], list[dict]] = {}
-    for it in rows:
-        cat = it.get("category") or "UNCATEGORIZED"
-        subcat = (it.get("subcategory") or "Otros").strip()[:40]
-        grouped.setdefault((cat, subcat), []).append(it)
-
-    parts = [
-        "<b>◉ PULSO IA · Resumen diario</b>",
-        f"<pre>{day} · UTC</pre>",
-        "",
-    ]
-    shown = 0
-    for (cat, subcat), items in sorted(grouped.items(), key=lambda x: (x[0][0], x[0][1])):
-        if shown >= SUMMARY_MAX_ITEMS:
-            break
-        cat_info = CATEGORY_MAP.get(cat, {"emoji": "📌", "label": "NEWS"})
-        parts.append(f"{cat_info['emoji']} <b>{html_escape(cat_info['label'], quote=False)}</b> · <i>{html_escape(subcat, quote=False)}</i>")
-        for it in items:
-            if shown >= SUMMARY_MAX_ITEMS:
-                break
-            title = html_escape((it.get("title") or "Sin título")[:90], quote=False)
-            url = html_escape(_summary_url(it), quote=True)
-            parts.append(f"• <a href=\"{url}\">{title}</a> <i>({html_escape(subcat, quote=False)})</i>")
-            shown += 1
-        parts.append("")
-    if len(rows) > shown:
-        parts.append(f"… y {len(rows) - shown} más.")
-    return "\n".join(parts)
-
-
-def _mark_summary_sent(items: list[dict], day: str) -> None:
-    for it in items:
-        iid = (it.get("item_id") or "").strip()
-        if not iid:
-            continue
-        _items.update_item(
-            Key={"item_id": iid},
-            UpdateExpression="SET daily_summary_date = :d",
-            ExpressionAttributeValues={":d": day},
-        )
-
-
-def _maybe_send_daily_summary(token: str) -> bool:
-    now = datetime.now(timezone.utc)
-    if now.hour < DAILY_SUMMARY_HOUR_UTC:
-        return False
-    day = now.strftime("%Y-%m-%d")
-    sent_items = query_by_telegram_status("true")
-    pending = []
-    for it in sent_items:
-        sent_day = _day_from_iso(it.get("sent_at") or "")
-        processed_day = _day_from_iso(it.get("processed_at") or "")
-        is_today = (sent_day == day) or (not sent_day and processed_day == day)
-        if is_today and (it.get("daily_summary_date") or "") != day:
-            pending.append(it)
-    if not pending:
-        return False
-
-    pending_sorted = sorted(pending, key=lambda x: (x.get("sent_at") or "", x.get("item_id") or ""))
-    summary = _build_daily_summary_card(day, pending_sorted)
-    resp = requests.post(
-        f"https://api.telegram.org/bot{token}/sendMessage",
-        json={"chat_id": CHANNEL_ID, "text": summary, "parse_mode": "HTML", "disable_web_page_preview": True},
-        timeout=20,
-    )
-    if resp.ok:
-        _mark_summary_sent(pending_sorted, day)
-        return True
-    logger.warning("daily summary failed: %s %s", resp.status_code, (resp.text or "")[:300])
+        else:
+            logger.error(json.dumps({"telegram_error": data, "attempt": attempt}))
+            time.sleep(2 ** attempt)
     return False
 
 
-def handler(event, context):
-    relevant_items = event.get("relevant_items") or []
+def send_telegram_card(token: str, item: dict) -> bool:
+    """Foto con caption + teclado; si falla, mensaje de solo texto (sin imagen)."""
+    text = format_message(item)
+    img = resolve_hero_image_url(item)
+    cap = _caption_under_telegram_limit(item)
+    if img:
+        pl: dict = {
+            "chat_id": CHANNEL_ID,
+            "photo": img,
+            "caption": cap,
+            "parse_mode": "MarkdownV2",
+        }
+        mark = _inline_keyboard(item)
+        if mark:
+            pl["reply_markup"] = mark
+        r = requests.post(
+            f"https://api.telegram.org/bot{token}/sendPhoto",
+            json=pl,
+            timeout=20,
+        )
+        d = r.json()
+        if d.get("ok"):
+            return True
+        logger.warning(
+            json.dumps(
+                {
+                    "action": "sendPhoto_fallback",
+                    "telegram": d,
+                    "photo": img[:150],
+                }
+            )
+        )
+    return send_message(token, text, item)
 
-    combined = build_publication_queue(relevant_items)
-    if not combined:
-        logger.info("Empty publication queue (no queued items and no new relevant)")
+def format_message(item: dict) -> str:
+    """Cabecera Pulso IA, metadatos, resumen y hashtags. El enlace al artículo va solo en el botón (con tracker)."""
+    cat = (item.get("category") or "USE_CASE").strip() or "USE_CASE"
+    meta = CATEGORY_META.get(cat, {"emoji": "📌", "tag": "#IA"})
+    source = item.get("source", "") or ""
+    source_tag = (
+        SOURCE_TAGS.get(source, "#Blog")
+        if not str(source).startswith("rss_")
+        else "#Blog"
+    )
+    title_raw = (item.get("title") or "")[:100] or "Sin título"
+    title = escape_md2(title_raw)
+    summary = escape_md2((item.get("summary_es") or ""))
+    sub_tag = meta["tag"]
+    cat_lbl = _category_label_es(cat)
+    rel = escape_md2(_relevance_line(item))
+    body = [
+        "*Pulso IA*",
+        "",
+        f"{meta['emoji']} *{title}*",
+        "",
+        summary,
+        "",
+        f"*Categoría:* {escape_md2(cat_lbl)}",
+        f"*Subcategoría:* {escape_md2(sub_tag)}",
+        f"*Fuente de datos:* {escape_md2(_source_data_label(str(source)))}",
+        f"*Relevancia:* {rel}",
+        "",
+        f"{escape_md2(sub_tag)} {escape_md2(source_tag)}",
+    ]
+    return "\n".join(body)
+
+def in_daytime_channel_window() -> bool:
+    """Activo 09:00–20:59 AR (excluye 21:00 en adelante = sleep)."""
+    now = datetime.now(ZoneInfo(TZ))
+    return 9 <= now.hour < 21
+
+def _normalize_item(d: dict) -> dict:
+    from decimal import Decimal
+
+    out = {}
+    for k, v in d.items():
+        if isinstance(v, Decimal):
+            out[k] = int(v) if v % 1 == 0 else float(v)
+        else:
+            out[k] = v
+    return out
+
+
+def handler(event, context):
+    ev = event if isinstance(event, dict) else {}
+    if ev.get("action") == "resend_latest":
+        item = get_latest_sent_item()
+        if not item:
+            return {"ok": False, "error": "no_sent_items"}
+        item = _normalize_item(item)
         token = get_bot_token()
-        _maybe_send_daily_summary(token)
+        ok = send_telegram_card(token, item)
         return {
-            "published": 0,
-            "sent": 0,
-            "failed": 0,
-            "total_new_in_run": len(relevant_items),
-            "queued_remaining": 0,
+            "ok": ok,
+            "action": "resend_latest",
+            "item_id": item.get("item_id"),
         }
 
-    to_send = combined[0]
-    remainder = combined[1:]
+    if not in_daytime_channel_window():
+        return {
+            "action": "skip_sleep_window",
+            "timezone": TZ,
+        }
 
+    # Un ítem por invocación, FIFO por processed_at (GSI outbox).
+    item = get_oldest_queued_item()
+    if not item:
+        return {"action": "noop", "reason": "empty_queue"}
+
+    item = _normalize_item(item)
     token = get_bot_token()
-    sent = 0
-    failed = 0
+    ok = send_telegram_card(token, item)
+    if not ok:
+        return {"action": "send_failed", "item_id": item.get("item_id")}
 
-    try:
-        item_id = to_send["item_id"]
-        slug = _allocate_slug(item_id)
-        read_btn = _public_p_url(slug)
-        keyboard = build_inline_keyboard(item_id, 0, read_button_url=read_btn)
-        result = send_card(token, to_send, keyboard)
-        if result:
-            mid = result.get("message_id")
-            mark_as_sent(item_id, mid, read_slug=slug)
-            sent = 1
-            for it in remainder:
-                if it.get("telegram_sent") not in ("queued", "true"):
-                    mark_as_queued(it["item_id"])
-        else:
-            try:
-                _short_links.delete_item(Key={"slug": slug})
-            except Exception:
-                pass
-            failed = 1
-    except Exception as e:
-        failed = 1
-        logger.error(json.dumps({"error": str(e), "item_id": to_send.get("item_id")}))
-
-    logger.info(
-        json.dumps(
-            {
-                "action": "publish_cadence",
-                "sent": sent,
-                "failed": failed,
-                "queued_remaining_after": len(remainder) if sent else len(combined),
-                "item_id": to_send.get("item_id"),
-            }
-        )
-    )
-    if sent and len(remainder) == 0:
-        _maybe_send_daily_summary(token)
-
+    mark_as_sent(item["item_id"])
     return {
-        "published": sent,
-        "sent": sent,
-        "failed": failed,
-        "total_new_in_run": len(relevant_items),
-        "queued_remaining": len(remainder) if sent else len(combined),
+        "action": "published",
+        "item_id": item.get("item_id"),
     }

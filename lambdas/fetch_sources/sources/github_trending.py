@@ -34,6 +34,10 @@ class GitHubTrendingSource(BaseSource):
         items = []
         for repo in resp.json().get("items", []):
             pushed = datetime.fromisoformat(repo["pushed_at"].replace("Z", "+00:00"))
+            owner = repo.get("owner") or {}
+            avatar = owner.get("avatar_url")
+            if avatar and not isinstance(avatar, str):
+                avatar = None
             items.append(RawNewsItem(
                 title=f"{repo['full_name']} - {repo['stargazers_count']}*",
                 url=repo["html_url"],
@@ -42,7 +46,8 @@ class GitHubTrendingSource(BaseSource):
                 raw_content=(
                     f"{repo.get('description', '')}. "
                     f"Topics: {', '.join(repo.get('topics', []))}"
-                )
+                ),
+                image_url=avatar,
             ))
         return items
 

@@ -152,6 +152,14 @@ def handler(event, context):
         preserved_sent = batch_get_telegram_sent([it["item_id"] for it in batch])
         for cl in classifications:
             raw = item_map.get(cl["item_id"], {})
+            is_rel = cl.get("is_relevant", False)
+            rscore = cl.get("relevance_score", 0)
+            queued = is_rel and rscore >= THRESHOLD
+            iu = raw.get("image_url")
+            if not (isinstance(iu, str) and iu.strip()):
+                iu = None
+            else:
+                iu = iu.strip()[:2000]
             processed = ProcessedNewsItem(
                 item_id=cl["item_id"],
                 source=raw.get("source", ""),
@@ -161,18 +169,20 @@ def handler(event, context):
                 category=cl.get("category") or "UNCATEGORIZED",
                 published_at=raw.get("published_at", now),
                 processed_at=now,
-                is_relevant=cl.get("is_relevant", False),
-                relevance_score=cl.get("relevance_score", 0),
+                is_relevant=is_rel,
+                relevance_score=rscore,
                 subcategory=_normalize_subcategory(
                     cl.get("category") or "UNCATEGORIZED",
                     cl.get("subcategory"),
                 ),
+                image_url=iu,
+                outbox_key="1" if queued else None,
             )
             prev = preserved_sent.get(cl["item_id"], "false")
             if prev in ("queued", "true"):
                 processed.telegram_sent = prev
             all_results.append(processed)
-            if processed.is_relevant and processed.relevance_score >= THRESHOLD:
+            if queued:
                 relevant_items.append(processed.__dict__)
                 cat = processed.category
                 by_category[cat] = by_category.get(cat, 0) + 1

@@ -10,6 +10,8 @@ paths = [
     ROOT / "lambdas" / "fetch_sources",
     ROOT / "lambdas" / "filter_ai_news",
     ROOT / "lambdas" / "publish_telegram",
+    ROOT / "lambdas" / "evening_summary",
+    ROOT / "lambdas" / "publish_telegram",
     ROOT / "shared",
 ]
 for p in reversed(paths):

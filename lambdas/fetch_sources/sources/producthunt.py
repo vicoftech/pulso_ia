@@ -17,6 +17,7 @@ query($cursor: String) {
     edges {
       node {
         id name tagline description url votesCount createdAt
+        thumbnail { url }
         topics { edges { node { name } } }
       }
     }
@@ -101,12 +102,19 @@ class ProductHuntSource(BaseSource):
                 url = node.get("url") or ""
                 tagline = node.get("tagline") or ""
                 desc = (node.get("description") or "")[:300]
+                th = node.get("thumbnail") or {}
+                u_thumb = th.get("url")
+                if u_thumb and isinstance(u_thumb, str):
+                    u_thumb = u_thumb.strip()[:2000] or None
+                else:
+                    u_thumb = None
                 items.append(RawNewsItem(
                     title=name,
                     url=url,
                     source=self.source_id(),
                     published_at=created.isoformat(),
-                    raw_content=f"{tagline}. {desc}"
+                    raw_content=f"{tagline}. {desc}",
+                    image_url=u_thumb,
                 ))
 
             cursor = page_info.get("endCursor")
