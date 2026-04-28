@@ -4,7 +4,7 @@ En `shared/dynamo.py` existe `batch_get_existing_ids()` que detecta ítems dupli
 Sin embargo, no existe un mecanismo para detectar noticias que son "el mismo evento" aunque provengan
 de fuentes distintas (por ejemplo, el mismo lanzamiento de OpenAI aparece en TechCrunch Y en VentureBeat).
 
-El resultado: el mismo evento se publica dos veces en el canal de Telegram con horas de diferencia.
+El resultado: el mismo evento se publica dos veces en el canal de Telegram con horas de diferencia haciendo menos creibles las noticias.
 
 ## Task
 
