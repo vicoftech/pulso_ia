@@ -44,3 +44,4 @@ aplicar `find_near_duplicate_ids` y excluir los near-duplicados antes de retorna
 - No comparar contra ítems ya en DynamoDB (solo dentro del lote actual)
 - No implementar similitud semántica con embeddings
 - No modificar el Step Functions ni el esquema de DynamoDB
+
