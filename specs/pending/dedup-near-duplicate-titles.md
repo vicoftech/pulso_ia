@@ -8,6 +8,7 @@ El resultado: el mismo evento se publica dos veces en el canal de Telegram con h
 
 ## Task
 
+
 Agregar una función `find_near_duplicate_ids(items: list[RawNewsItem]) -> set[str]` en `shared/dynamo.py`
 que, dado un lote de ítems nuevos, detecte cuáles son near-duplicados entre sí por título similar.
 
