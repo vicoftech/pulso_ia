@@ -149,9 +149,9 @@ jobs:
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
-          SPEC_CONTENT=$(cat "specs/done/${{ steps.spec.outputs.ticket }}.md")
+          SPEC_CONTENT=$(tail -n 200 "specs/done/${{ steps.spec.outputs.ticket }}.md" 2>/dev/null || echo "Spec no disponible")
           DIFF_STAT=$(git diff main...${{ steps.spec.outputs.branch }} --stat 2>/dev/null || echo "Sin diff disponible")
-          TEST_OUTPUT=$(cat /tmp/test-output.txt 2>/dev/null || echo "Sin output de tests")
+          TEST_OUTPUT=$(tail -n 200 /tmp/test-output.txt 2>/dev/null || echo "Sin output de tests")
 
           claude -p "
           Generá la descripción de un Pull Request en español para el proyecto Pulso IA.
