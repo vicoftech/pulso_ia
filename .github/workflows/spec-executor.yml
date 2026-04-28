@@ -1,0 +1,193 @@
+name: Pulso IA — Spec Executor
+
+on:
+  push:
+    paths:
+      - 'specs/pending/**.md'   # Solo se activa con specs en /pending
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  execute-spec:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Setup Node.js 22 (para Claude Code CLI)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Instalar Claude Code CLI
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Detectar spec pusheado
+        id: spec
+        run: |
+          SPEC_FILE=$(git diff --name-only HEAD~1 HEAD | grep '^specs/pending/.*\.md$' | head -1)
+          if [ -z "$SPEC_FILE" ]; then
+            echo "No se encontró ningún spec nuevo en specs/pending/. Saliendo."
+            exit 1
+          fi
+          echo "file=$SPEC_FILE" >> $GITHUB_OUTPUT
+          TICKET_NAME=$(basename "$SPEC_FILE" .md)
+          echo "ticket=$TICKET_NAME" >> $GITHUB_OUTPUT
+          echo "branch=feature/$TICKET_NAME" >> $GITHUB_OUTPUT
+          echo "Spec detectado: $SPEC_FILE → rama feature/$TICKET_NAME"
+
+      - name: Crear rama del ticket
+        run: |
+          git config user.name "Pulso IA Bot"
+          git config user.email "bot@pulso-ia"
+          git checkout -b ${{ steps.spec.outputs.branch }}
+
+      - name: Instalar dependencias del proyecto (para tests)
+        run: |
+          pip install pytest pytest-cov
+          pip install -r lambdas/fetch_sources/requirements.txt || true
+          pip install -r lambdas/filter_ai_news/requirements.txt || true
+          pip install -r lambdas/publish_telegram/requirements.txt || true
+
+      - name: Ejecutar spec con Claude Code
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          SPEC_CONTENT=$(cat "${{ steps.spec.outputs.file }}")
+
+          claude -p "
+          Sos el agente de desarrollo de Pulso IA, un pipeline serverless en AWS.
+
+          CONTEXTO DEL PROYECTO (CLAUDE.md):
+          $(cat CLAUDE.md)
+
+          TAREA — ejecutar el siguiente spec exactamente:
+
+          $SPEC_CONTENT
+
+          REGLAS DE EJECUCIÓN:
+          1. Implementá el código descrito en el spec
+          2. Escribí o actualizá los tests correspondientes en tests/
+          3. Respetá todas las convenciones de CLAUDE.md
+          4. No modifiques archivos fuera del scope del spec
+          5. No toques infra/ salvo que el spec lo indique explícitamente
+          6. Si el spec agrega una fuente nueva, actualizá sources/sources.json también
+          " \
+          --allowedTools "Read,Write,Edit,Bash,Glob,Grep" \
+          --max-turns 15 \
+          --dangerously-skip-permissions \
+          --output-format text
+
+      - name: Correr tests
+        run: |
+          export PYTHONPATH="lambdas/fetch_sources:lambdas/filter_ai_news:lambdas/publish_telegram:lambdas/evening_summary:shared:$PYTHONPATH"
+          export DYNAMODB_TABLE="test-table"
+          export TELEGRAM_CHANNEL_ID="-1000000000000"
+
+          pytest tests/ \
+            --cov=lambdas \
+            --cov=shared \
+            --cov-report=term-missing \
+            --tb=short \
+            -q 2>&1 | tee /tmp/test-output.txt
+        continue-on-error: true
+
+      - name: Mover spec de pending → done
+        run: |
+          mkdir -p specs/done
+          SPEC_FILE="${{ steps.spec.outputs.file }}"
+          TICKET_NAME="${{ steps.spec.outputs.ticket }}"
+          DONE_FILE="specs/done/${TICKET_NAME}.md"
+
+          # Agregar log de ejecución al spec
+          echo "" >> "$SPEC_FILE"
+          echo "---" >> "$SPEC_FILE"
+          echo "## Execution log" >> "$SPEC_FILE"
+          echo "- Ejecutado: $(date -u '+%Y-%m-%d %H:%M UTC')" >> "$SPEC_FILE"
+          echo "- Rama: feature/$TICKET_NAME" >> "$SPEC_FILE"
+          echo "- Runner: $GITHUB_RUN_ID" >> "$SPEC_FILE"
+
+          mv "$SPEC_FILE" "$DONE_FILE"
+
+      - name: Commit del código generado + spec movido
+        run: |
+          git add -A
+          if git diff --staged --quiet; then
+            echo "Sin cambios para commitear."
+          else
+            git commit -m "feat(${{ steps.spec.outputs.ticket }}): implementación generada por IA
+
+          Spec movido: specs/pending → specs/done
+          Generado automáticamente por Claude Code pipeline
+
+          [skip ci]"
+          fi
+
+      - name: Push de la rama
+        run: |
+          git push origin ${{ steps.spec.outputs.branch }}
+
+      - name: Generar descripción del PR
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          SPEC_CONTENT=$(cat "specs/done/${{ steps.spec.outputs.ticket }}.md")
+          DIFF_STAT=$(git diff main...${{ steps.spec.outputs.branch }} --stat 2>/dev/null || echo "Sin diff disponible")
+          TEST_OUTPUT=$(cat /tmp/test-output.txt 2>/dev/null || echo "Sin output de tests")
+
+          claude -p "
+          Generá la descripción de un Pull Request en español para el proyecto Pulso IA.
+          Usá formato markdown. Sé conciso (máximo 25 líneas).
+
+          Incluí estas secciones:
+          ## ¿Qué hace este PR?
+          ## Archivos modificados
+          ## Cómo testear localmente
+          ## Estado de los tests
+
+          SPEC ORIGINAL:
+          $SPEC_CONTENT
+
+          DIFF STAT:
+          $DIFF_STAT
+
+          OUTPUT DE TESTS:
+          $TEST_OUTPUT
+          " --max-turns 1 --output-format text > /tmp/pr-description.md
+
+      - name: Crear PR automático
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr create \
+            --title "feat(${{ steps.spec.outputs.ticket }}): implementación IA" \
+            --body-file /tmp/pr-description.md \
+            --base main \
+            --head ${{ steps.spec.outputs.branch }} \
+            --label "ai-generated" \
+            --label "needs-review"
+
+      - name: Resumen del run
+        run: |
+          echo "### ✅ Pipeline completado" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Spec**: \`${{ steps.spec.outputs.file }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Movido a**: \`specs/done/${{ steps.spec.outputs.ticket }}.md\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Rama**: \`${{ steps.spec.outputs.branch }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **PR**: creado automáticamente" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "#### Output de tests" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          tail -10 /tmp/test-output.txt >> $GITHUB_STEP_SUMMARY || true
+          echo '```' >> $GITHUB_STEP_SUMMARY
