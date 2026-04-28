@@ -7,12 +7,47 @@ from typing import Any, List, Optional
 
 from boto3.dynamodb.conditions import Key
 
-from models import ProcessedNewsItem
+from models import ProcessedNewsItem, RawNewsItem
 
 TABLE_NAME = os.environ["DYNAMODB_TABLE"]
 dynamodb = boto3.resource("dynamodb")
 table = dynamodb.Table(TABLE_NAME)
 GSI_TELEGRAM = "telegram_sent-processed_at-index"
+
+
+_STOPWORDS = {
+    "el", "la", "los", "las", "de", "del", "en", "y", "a",
+    "the", "of", "for", "with", "and", "or", "is", "to",
+}
+
+
+def _significant_words(title: str) -> set:
+    return {w for w in title.lower().split() if w not in _STOPWORDS}
+
+
+def find_near_duplicate_ids(items: list[RawNewsItem]) -> set[str]:
+    """Retorna item_ids a descartar por título near-duplicado (Jaccard >60% palabras significativas)."""
+    to_discard: set[str] = set()
+    n = len(items)
+    for i in range(n):
+        if items[i].item_id in to_discard:
+            continue
+        words_i = _significant_words(getattr(items[i], "title", ""))
+        for j in range(i + 1, n):
+            if items[j].item_id in to_discard:
+                continue
+            words_j = _significant_words(getattr(items[j], "title", ""))
+            union = words_i | words_j
+            if not union:
+                continue
+            if len(words_i & words_j) / len(union) > 0.6:
+                # Descartar el más antiguo; si igual, descartar el que aparece segundo (j)
+                if items[i].published_at >= items[j].published_at:
+                    to_discard.add(items[j].item_id)
+                else:
+                    to_discard.add(items[i].item_id)
+                    break
+    return to_discard
 
 
 def batch_get_existing_ids(item_ids: List[str]) -> set:

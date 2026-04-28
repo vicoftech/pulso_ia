@@ -12,7 +12,7 @@ if os.path.isdir(_shared):
     sys.path.insert(0, _shared)
 
 # Import dynamo before sources: source modules prepend sys.path and can shadow /var/task.
-from dynamo import batch_get_existing_ids
+from dynamo import batch_get_existing_ids, find_near_duplicate_ids
 from sources import SOURCE_REGISTRY
 
 logger = logging.getLogger()
@@ -48,6 +48,9 @@ def handler(event, context):
     all_ids = [i.item_id for i in all_items]
     existing_ids = batch_get_existing_ids(all_ids) if all_ids else set()
     new_items = [i for i in all_items if i.item_id not in existing_ids][:MAX_ITEMS]
+    near_dup_ids = find_near_duplicate_ids(new_items)
+    if near_dup_ids:
+        new_items = [i for i in new_items if i.item_id not in near_dup_ids]
 
     by_source = {}
     for item in new_items:
