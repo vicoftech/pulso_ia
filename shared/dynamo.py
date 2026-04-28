@@ -7,12 +7,56 @@ from typing import Any, List, Optional
 
 from boto3.dynamodb.conditions import Key
 
-from models import ProcessedNewsItem
+from models import ProcessedNewsItem, RawNewsItem
 
 TABLE_NAME = os.environ["DYNAMODB_TABLE"]
 dynamodb = boto3.resource("dynamodb")
 table = dynamodb.Table(TABLE_NAME)
 GSI_TELEGRAM = "telegram_sent-processed_at-index"
+
+
+STOPWORDS = frozenset({
+    "el", "la", "los", "las", "de", "del", "en", "y", "a",
+    "the", "of", "for", "with", "and", "or", "is", "to",
+})
+
+
+def _significant_words(title: str) -> set[str]:
+    result = set()
+    for w in title.lower().split():
+        w = w.strip(".,;:!?\"'()[]{}/-")
+        if w and w not in STOPWORDS:
+            result.add(w)
+    return result
+
+
+def find_near_duplicate_ids(items: list[RawNewsItem]) -> set[str]:
+    """Returns item_ids to discard as near-duplicates within the batch.
+
+    Two titles are near-duplicates if they share >60% of significant words
+    (Jaccard similarity). In each pair the older item is discarded; if
+    published_at is equal, the second item in the list is discarded.
+    No AWS calls are made.
+    """
+    to_discard: set[str] = set()
+    for i in range(len(items)):
+        if items[i].item_id in to_discard:
+            continue
+        words_i = _significant_words(items[i].title)
+        for j in range(i + 1, len(items)):
+            if items[j].item_id in to_discard:
+                continue
+            words_j = _significant_words(items[j].title)
+            if not words_i or not words_j:
+                continue
+            union = words_i | words_j
+            if len(words_i & words_j) / len(union) > 0.6:
+                if items[i].published_at >= items[j].published_at:
+                    to_discard.add(items[j].item_id)
+                else:
+                    to_discard.add(items[i].item_id)
+                    break
+    return to_discard
 
 
 def batch_get_existing_ids(item_ids: List[str]) -> set:

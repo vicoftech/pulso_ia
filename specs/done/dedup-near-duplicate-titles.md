@@ -47,3 +47,9 @@ aplicar `find_near_duplicate_ids` y excluir los near-duplicados antes de retorna
 - No implementar similitud semántica con embeddings
 - No modificar el Step Functions ni el esquema de DynamoDB
 
+
+---
+## Execution log
+- Ejecutado: 2026-04-28 21:26 UTC
+- Rama: feature/dedup-near-duplicate-titles
+- Runner: 25078402056

@@ -22,3 +22,4 @@ for p in reversed(paths):
 # Safe defaults for imports that expect AWS env vars.
 os.environ.setdefault("DYNAMODB_TABLE", "test-table")
 os.environ.setdefault("TELEGRAM_CHANNEL_ID", "-1000000000000")
+os.environ.setdefault("AWS_DEFAULT_REGION", "us-east-1")
