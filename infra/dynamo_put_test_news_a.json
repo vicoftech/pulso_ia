@@ -1,0 +1,17 @@
+{
+  "TableName": "pulso-ia_items",
+  "Item": {
+    "item_id": { "S": "bf0604e498a8ebfaefac94cd06080cfd" },
+    "source": { "S": "arxiv" },
+    "title": { "S": "[Pulso IA test A] Nuevo benchmark LLM reproducible" },
+    "url": { "S": "https://pulso-ia-test-2026-a.example.com/1" },
+    "summary_es": { "S": "Noticia de prueba A: benchmark para medir alucinaciones en modelos grandes, generada para validar la cola de publicación." },
+    "category": { "S": "MODEL_UPDATE" },
+    "published_at": { "S": "2026-04-10T14:00:00+00:00" },
+    "processed_at": { "S": "2026-04-13T22:00:00+00:00" },
+    "is_relevant": { "BOOL": true },
+    "relevance_score": { "N": "88" },
+    "telegram_sent": { "S": "false" },
+    "ttl": { "N": "1778709673" }
+  }
+}

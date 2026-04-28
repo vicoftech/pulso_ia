@@ -1,0 +1,17 @@
+{
+  "TableName": "pulso-ia_items",
+  "Item": {
+    "item_id": { "S": "965c8a9a3aa2613a374ece2ea839cdb5" },
+    "source": { "S": "producthunt" },
+    "title": { "S": "[Pulso IA test B] Herramienta IA para resumir feeds técnicos" },
+    "url": { "S": "https://pulso-ia-test-2026-b.example.com/2" },
+    "summary_es": { "S": "Noticia de prueba B: producto que resume RSS y publica a Telegram; segunda en la cola de prueba." },
+    "category": { "S": "NEW_PRODUCT" },
+    "published_at": { "S": "2026-04-13T16:00:00+00:00" },
+    "processed_at": { "S": "2026-04-13T22:00:00+00:00" },
+    "is_relevant": { "BOOL": true },
+    "relevance_score": { "N": "75" },
+    "telegram_sent": { "S": "false" },
+    "ttl": { "N": "1778709673" }
+  }
+}
