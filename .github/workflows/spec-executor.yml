@@ -85,7 +85,7 @@ jobs:
           6. Si el spec agrega una fuente nueva, actualizá sources/sources.json también
           " \
           --allowedTools "Read,Write,Edit,Bash,Glob,Grep" \
-          --max-turns 15 \
+          --max-turns 30 \
           --dangerously-skip-permissions \
           --output-format text
 
