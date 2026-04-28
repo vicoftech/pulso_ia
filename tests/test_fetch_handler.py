@@ -14,6 +14,7 @@ class _FakeSource:
 def test_fetch_handler_keeps_only_new_items(monkeypatch):
     monkeypatch.setattr("handler.SOURCE_REGISTRY", {"arxiv": _FakeSource})
     monkeypatch.setattr("handler.batch_get_existing_ids", lambda ids: {"id1"})
+    monkeypatch.setattr("handler.find_near_duplicate_ids", lambda items: set())
 
     result = handler({"sources": ["arxiv"], "lookback_hours": 24}, None)
 

@@ -7,12 +7,54 @@ from typing import Any, List, Optional
 
 from boto3.dynamodb.conditions import Key
 
-from models import ProcessedNewsItem
+from models import ProcessedNewsItem, RawNewsItem
 
 TABLE_NAME = os.environ["DYNAMODB_TABLE"]
 dynamodb = boto3.resource("dynamodb")
 table = dynamodb.Table(TABLE_NAME)
 GSI_TELEGRAM = "telegram_sent-processed_at-index"
+
+
+_STOPWORDS = {
+    "el", "la", "los", "las", "de", "del", "en", "y", "a",
+    "the", "of", "for", "with", "and", "or", "is", "to",
+}
+
+
+def _significant_words(title: str) -> set[str]:
+    return {w for w in title.lower().split() if w not in _STOPWORDS}
+
+
+def find_near_duplicate_ids(items: list[RawNewsItem]) -> set[str]:
+    """Retorna item_ids a descartar por títulos near-duplicados dentro del lote.
+
+    Dos ítems son near-duplicados si la similitud Jaccard de sus palabras
+    significativas supera 0.6. De cada par se descarta el más antiguo;
+    si published_at es igual, se descarta el que aparece segundo en la lista.
+    """
+    word_sets = [(item, _significant_words(item.title)) for item in items]
+    to_discard: set[str] = set()
+
+    for i in range(len(word_sets)):
+        item_a, words_a = word_sets[i]
+        if item_a.item_id in to_discard:
+            continue
+        for j in range(i + 1, len(word_sets)):
+            item_b, words_b = word_sets[j]
+            if item_b.item_id in to_discard:
+                continue
+            union = words_a | words_b
+            if not union:
+                continue
+            if len(words_a & words_b) / len(union) > 0.6:
+                # item_a appears first (i < j): if equal published_at, discard item_b
+                if item_a.published_at >= item_b.published_at:
+                    to_discard.add(item_b.item_id)
+                else:
+                    to_discard.add(item_a.item_id)
+                    break  # item_a descartado, saltar sus pares restantes
+
+    return to_discard
 
 
 def batch_get_existing_ids(item_ids: List[str]) -> set:
