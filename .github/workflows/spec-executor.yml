@@ -36,7 +36,14 @@ jobs:
       - name: Detectar spec pusheado
         id: spec
         run: |
-          SPEC_FILE=$(git diff --name-only HEAD~1 HEAD | grep '^specs/pending/.*\.md$' | head -1)
+          BEFORE="${{ github.event.before }}"
+          AFTER="${{ github.sha }}"
+          if [ -n "$BEFORE" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ]; then
+            CHANGED=$(git diff --name-only "$BEFORE" "$AFTER")
+          else
+            CHANGED=$(git diff-tree --no-commit-id --name-only -r "$AFTER")
+          fi
+          SPEC_FILE=$(echo "$CHANGED" | grep '^specs/pending/.*\.md$' | head -1)
           if [ -z "$SPEC_FILE" ]; then
             echo "No se encontró ningún spec nuevo en specs/pending/. Saliendo."
             exit 1
@@ -44,14 +51,14 @@ jobs:
           echo "file=$SPEC_FILE" >> $GITHUB_OUTPUT
           TICKET_NAME=$(basename "$SPEC_FILE" .md)
           echo "ticket=$TICKET_NAME" >> $GITHUB_OUTPUT
-          echo "branch=feature/$TICKET_NAME" >> $GITHUB_OUTPUT
-          echo "Spec detectado: $SPEC_FILE → rama feature/$TICKET_NAME"
+          echo "branch=feature/${TICKET_NAME}-${GITHUB_RUN_ID}" >> $GITHUB_OUTPUT
+          echo "Spec detectado: $SPEC_FILE → rama feature/${TICKET_NAME}-${GITHUB_RUN_ID}"
 
       - name: Crear rama del ticket
         run: |
           git config user.name "Pulso IA Bot"
           git config user.email "bot@pulso-ia"
-          git checkout -b ${{ steps.spec.outputs.branch }}
+          git checkout -B ${{ steps.spec.outputs.branch }}
 
       - name: Instalar dependencias del proyecto (para tests)
         run: |
