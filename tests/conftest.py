@@ -19,6 +19,7 @@ for p in reversed(paths):
     if p_str not in sys.path:
         sys.path.insert(0, p_str)
 
-# Safe defaults for imports that expect AWS env vars.
+# Safe defaults for imports that expect AWS env vars (boto3 exige region al crear client/resource).
+os.environ.setdefault("AWS_DEFAULT_REGION", "us-east-1")
 os.environ.setdefault("DYNAMODB_TABLE", "test-table")
 os.environ.setdefault("TELEGRAM_CHANNEL_ID", "-1000000000000")
