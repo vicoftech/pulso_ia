@@ -150,14 +150,20 @@ jobs:
         run: |
           git push origin ${{ steps.spec.outputs.branch }}
 
+      # Segundo llamado a Claude en el mismo job: si falla (cuota, max-turns 1 corto, etc.) el workflow
+      # abortaba antes y "Crear PR" parecía el culpable — usamos fallback y seguimos.
       - name: Generar descripción del PR
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
-          SPEC_CONTENT=$(tail -n 200 "specs/done/${{ steps.spec.outputs.ticket }}.md" 2>/dev/null || echo "Spec no disponible")
-          DIFF_STAT=$(git diff "main...${{ steps.spec.outputs.branch }}" --stat 2>/dev/null || echo "Sin diff disponible")
+          set -e
+          TICKET="${{ steps.spec.outputs.ticket }}"
+          BRANCH="${{ steps.spec.outputs.branch }}"
+          SPEC_CONTENT=$(tail -n 200 "specs/done/${TICKET}.md" 2>/dev/null || echo "Spec no disponible")
+          DIFF_STAT=$(git diff "main...${BRANCH}" --stat 2>/dev/null || echo "Sin diff disponible")
           TEST_OUTPUT=$(tail -n 200 /tmp/test-output.txt 2>/dev/null || echo "Sin output de tests")
 
+          set +e
           claude -p "
           Generá la descripción de un Pull Request en español para el proyecto Pulso IA.
           Usá formato markdown. Sé conciso (máximo 25 líneas).
@@ -169,14 +175,34 @@ jobs:
           ## Estado de los tests
 
           SPEC ORIGINAL:
-          $SPEC_CONTENT
+          ${SPEC_CONTENT}
 
           DIFF STAT:
-          $DIFF_STAT
+          ${DIFF_STAT}
 
           OUTPUT DE TESTS:
-          $TEST_OUTPUT
+          ${TEST_OUTPUT}
           " --max-turns 1 --output-format text > /tmp/pr-description.md
+          DESC_RC=$?
+          set -e
+
+          if [ "${DESC_RC}" -ne 0 ] || [ ! -s /tmp/pr-description.md ]; then
+            echo "::warning::Claude no generó la descripción del PR (exit ${DESC_RC} o archivo vacío). Descripción de respaldo sin bloquear el merge."
+            {
+              printf '%s\n\n' "## ¿Qué hace este PR?"
+              printf '%s\n\n' "(Descripción automática con Claude no disponible; ver diff y spec abajo.)"
+              printf '%s\n\n' "### Extracto del spec (ticket: ${TICKET})"
+              printf '%s\n\n' "${SPEC_CONTENT}"
+              printf '%s\n\n' "### Diff (stat main...${BRANCH})"
+              printf '%s\n' '```'
+              printf '%s\n' "${DIFF_STAT}"
+              printf '%s\n\n' '```'
+              printf '%s\n\n' "### Tests (pytest, últimas líneas)"
+              printf '%s\n' '```'
+              printf '%s\n' "${TEST_OUTPUT}"
+              printf '%s\n' '```'
+            } > /tmp/pr-description.md
+          fi
 
       # Usamos la REST API directamente: `gh pr create` en CI suele romperse (etiquetas, stderr, exit codes opacos).
       - name: Crear PR automático
