@@ -7,7 +7,39 @@ from typing import Any, List, Optional
 
 from boto3.dynamodb.conditions import Key
 
-from models import ProcessedNewsItem
+from models import ProcessedNewsItem, RawNewsItem
+
+_STOPWORDS = {
+    "el", "la", "los", "las", "de", "del", "en", "y", "a",
+    "the", "of", "for", "with", "and", "or", "is", "to",
+}
+_PUNCT = str.maketrans("", "", ".,;:!?\"'()[]{}…—")
+
+
+def _significant_words(title: str) -> set[str]:
+    return {
+        w for w in (t.translate(_PUNCT) for t in title.lower().split())
+        if w and w not in _STOPWORDS
+    }
+
+
+def find_near_duplicate_ids(items: list[RawNewsItem]) -> set[str]:
+    """Retorna item_ids a descartar por título near-duplicado (>60% Jaccard) dentro del lote."""
+    to_discard: set[str] = set()
+    for i in range(len(items)):
+        for j in range(i + 1, len(items)):
+            words_i = _significant_words(items[i].title)
+            words_j = _significant_words(items[j].title)
+            union = words_i | words_j
+            if not union:
+                continue
+            if len(words_i & words_j) / len(union) > 0.6:
+                # Discard the older item; if published_at is equal, discard the second (j)
+                if items[i].published_at >= items[j].published_at:
+                    to_discard.add(items[j].item_id)
+                else:
+                    to_discard.add(items[i].item_id)
+    return to_discard
 
 TABLE_NAME = os.environ["DYNAMODB_TABLE"]
 dynamodb = boto3.resource("dynamodb")
