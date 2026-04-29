@@ -1,5 +1,6 @@
 # shared/dynamo.py
 import boto3
+import re
 from datetime import datetime, timezone
 import os
 from decimal import Decimal
@@ -7,7 +8,12 @@ from typing import Any, List, Optional
 
 from boto3.dynamodb.conditions import Key
 
-from models import ProcessedNewsItem
+from models import ProcessedNewsItem, RawNewsItem
+
+_STOPWORDS = frozenset({
+    "el", "la", "los", "las", "de", "del", "en", "y", "a",
+    "the", "of", "for", "with", "and", "or", "is", "to",
+})
 
 TABLE_NAME = os.environ["DYNAMODB_TABLE"]
 dynamodb = boto3.resource("dynamodb")
@@ -31,6 +37,41 @@ def batch_get_existing_ids(item_ids: List[str]) -> set:
         for item in response.get("Responses", {}).get(TABLE_NAME, []):
             existing.add(item["item_id"])
     return existing
+
+
+def _significant_words(title: str) -> set[str]:
+    words = re.sub(r"[^\w\s]", "", title.lower()).split()
+    return {w for w in words if w not in _STOPWORDS and len(w) > 1}
+
+
+def find_near_duplicate_ids(items: List[RawNewsItem]) -> set[str]:
+    """Retorna item_ids a descartar por similitud de título (>60% palabras significativas en común).
+
+    Compara pares dentro del lote. En cada par near-duplicado descarta el ítem más antiguo
+    (menor published_at); si son iguales, descarta el que aparece segundo en la lista.
+    Sin llamadas a AWS — lógica pura O(n²).
+    """
+    if len(items) < 2:
+        return set()
+    to_discard: set[str] = set()
+    for i in range(len(items)):
+        if items[i].item_id in to_discard:
+            continue
+        a_words = _significant_words(items[i].title)
+        for j in range(i + 1, len(items)):
+            if items[j].item_id in to_discard:
+                continue
+            b_words = _significant_words(items[j].title)
+            if not a_words or not b_words:
+                continue
+            common = len(a_words & b_words)
+            if common / max(len(a_words), len(b_words)) > 0.6:
+                if items[i].published_at >= items[j].published_at:
+                    to_discard.add(items[j].item_id)
+                else:
+                    to_discard.add(items[i].item_id)
+                    break
+    return to_discard
 
 
 def _item_to_dynamo(item: ProcessedNewsItem) -> dict[str, Any]:

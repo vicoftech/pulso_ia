@@ -56,3 +56,9 @@ aplicar `find_near_duplicate_ids` y excluir los near-duplicados antes de retorna
 - Ejecutado: 2026-04-29 00:53 UTC
 - Rama: feature/dedup-near-duplicate-titles
 - Runner: 25085446195
+
+---
+## Execution log
+- Ejecutado: 2026-04-29 02:08 UTC
+- Rama: feature/dedup-near-duplicate-titles
+- Runner: 25087352398
