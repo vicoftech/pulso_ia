@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: write
+  issues: write
   pull-requests: write
 
 jobs:
@@ -177,13 +178,91 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh pr create \
-            --title "feat(${{ steps.spec.outputs.ticket }}): implementación IA" \
-            --body-file /tmp/pr-description.md \
-            --base main \
-            --head ${{ steps.spec.outputs.branch }} \
-            --label "ai-generated" \
-            --label "needs-review"
+          set -euo pipefail
+          REPO="${{ github.repository }}"
+          OWNER="${{ github.repository_owner }}"
+          BRANCH="${{ steps.spec.outputs.branch }}"
+          TICKET="${{ steps.spec.outputs.ticket }}"
+          HEAD_FILTER="${OWNER}:${BRANCH}"
+
+          gh version
+
+          if [ ! -s /tmp/pr-description.md ]; then
+            printf '%s\n\n%s\n\n%s\n\n%s\n' \
+              "## ¿Qué hace este PR?" \
+              "- Implementación generada desde el spec \`${TICKET}\`." \
+              "---" \
+              "_Descripción corta pendiente (Claude no generó archivo de cuerpo)._" \
+              > /tmp/pr-description.md
+          fi
+
+          # Sin estas etiquetas en el repo, `gh pr create --label` devuelve exit 1 (error típico en CI).
+          gh label create "ai-generated" --color "1D76DB" --description "Pipeline spec-executor / Claude" 2>/dev/null || true
+          gh label create "needs-review" --color "FBCA04" --description "Revisión humana sugerida" 2>/dev/null || true
+
+          EXISTING=""
+          for hf in "${HEAD_FILTER}" "${BRANCH}"; do
+            CAND=$(gh pr list --repo "${REPO}" --head "${hf}" --state open \
+              --json number --jq '.[0].number // empty' 2>/dev/null || true)
+            if [ -n "${CAND}" ]; then
+              EXISTING="${CAND}"
+              break
+            fi
+          done
+
+          if [ -n "${EXISTING}" ]; then
+            echo "Ya existe el PR #${EXISTING} para la rama. Evitamos duplicados."
+            exit 0
+          fi
+
+          PR_TITLE="feat(${TICKET}): implementación IA"
+          COMMON_ARGS=(
+            --repo "${REPO}"
+            --title "${PR_TITLE}"
+            --body-file /tmp/pr-description.md
+            --base main
+            --head "${BRANCH}"
+          )
+
+          LABEL_ARGS=( --label "ai-generated" --label "needs-review" )
+
+          set +e
+          FIRST_OUT=$(gh pr create "${COMMON_ARGS[@]}" "${LABEL_ARGS[@]}" 2>&1)
+          FIRST_RC=$?
+          set -euo pipefail
+
+          if [ "${FIRST_RC}" -eq 0 ]; then
+            echo "${FIRST_OUT}"
+            echo "PR creado con etiquetas."
+            exit 0
+          fi
+          echo "gh pr create (con labels) código ${FIRST_RC}:"
+          echo "${FIRST_OUT}"
+
+          if echo "${FIRST_OUT}" | grep -qiE '(pull request|pull requests).{0,140}already|already exists'; then
+            echo "PR ya existía según respuesta de la API."
+            exit 0
+          fi
+
+          set +e
+          SECOND_OUT=$(gh pr create "${COMMON_ARGS[@]}" 2>&1)
+          SECOND_RC=$?
+          set -euo pipefail
+
+          if [ "${SECOND_RC}" -eq 0 ]; then
+            echo "${SECOND_OUT}"
+            echo "::warning::PR creado sin etiquetas (revisá permisos o creá manualmente ai-generated / needs-review)."
+            exit 0
+          fi
+
+          echo "::error::gh pr create (sin labels) código ${SECOND_RC}:"
+          echo "${SECOND_OUT}"
+
+          if echo "${SECOND_OUT}" | grep -qiE '(pull request|pull requests).{0,140}already|already exists'; then
+            exit 0
+          fi
+
+          exit 1
 
       - name: Resumen del run
         run: |
