@@ -7,6 +7,7 @@ de fuentes distintas (por ejemplo, el mismo lanzamiento de OpenAI aparece en Tec
 El resultado: el mismo evento se publica dos veces en el canal de Telegram con horas de diferencia haciendo menos creibles las noticias.
 
 
+
 ## Task
 
 
@@ -52,6 +53,6 @@ aplicar `find_near_duplicate_ids` y excluir los near-duplicados antes de retorna
 
 ---
 ## Execution log
-- Ejecutado: 2026-04-29 00:53 UTC
+- Ejecutado: 2026-04-29 01:10 UTC
 - Rama: feature/dedup-near-duplicate-titles
-- Runner: 25085446195
+- Runner: 25085927527
