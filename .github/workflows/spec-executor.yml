@@ -118,7 +118,7 @@ jobs:
           TICKET_NAME="${{ steps.spec.outputs.ticket }}"
           DONE_FILE="specs/done/${TICKET_NAME}.md"
 
-          # Agregar log de ejecución al spec
+          # Agregar log de ejecución al spec (sigue tracked en pending hasta el mv)
           echo "" >> "$SPEC_FILE"
           echo "---" >> "$SPEC_FILE"
           echo "## Execution log" >> "$SPEC_FILE"
@@ -126,7 +126,11 @@ jobs:
           echo "- Rama: feature/$TICKET_NAME" >> "$SPEC_FILE"
           echo "- Runner: $GITHUB_RUN_ID" >> "$SPEC_FILE"
 
-          mv "$SPEC_FILE" "$DONE_FILE"
+          # `git mv` registra borrado en pending + destino en done; `mv` solo deja dos copias al mergear o en el índice.
+          git mv -f "$SPEC_FILE" "$DONE_FILE"
+
+          test ! -f "specs/pending/${TICKET_NAME}.md" \
+            || { echo "::error::El spec sigue existiendo en pending tras git mv"; exit 1; }
 
       - name: Commit del código generado + spec movido
         run: |
