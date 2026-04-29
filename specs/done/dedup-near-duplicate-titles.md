@@ -50,3 +50,9 @@ aplicar `find_near_duplicate_ids` y excluir los near-duplicados antes de retorna
 
 
 <!-- dummy: disparar workflow spec-executor -->
+
+---
+## Execution log
+- Ejecutado: 2026-04-29 00:51 UTC
+- Rama: feature/dedup-near-duplicate-titles
+- Runner: 25085411487
