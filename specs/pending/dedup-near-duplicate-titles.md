@@ -7,7 +7,6 @@ de fuentes distintas (por ejemplo, el mismo lanzamiento de OpenAI aparece en Tec
 El resultado: el mismo evento se publica dos veces en el canal de Telegram con horas de diferencia haciendo menos creibles las noticias.
 
 
-
 ## Task
 
 
