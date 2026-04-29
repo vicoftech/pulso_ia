@@ -48,3 +48,5 @@ aplicar `find_near_duplicate_ids` y excluir los near-duplicados antes de retorna
 - No implementar similitud semántica con embeddings
 - No modificar el Step Functions ni el esquema de DynamoDB
 
+
+<!-- dummy: disparar workflow spec-executor -->

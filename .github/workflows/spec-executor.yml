@@ -26,12 +26,15 @@ jobs:
         with:
           python-version: '3.12'
 
+      # Temporal: sin Node/Claude para correr rápido el pipeline y probar push/rama/tests/PR (quitar estos `if: false`).
       - name: Setup Node.js 22 (para Claude Code CLI)
+        if: false
         uses: actions/setup-node@v4
         with:
           node-version: '22'
 
       - name: Instalar Claude Code CLI
+        if: false
         run: npm install -g @anthropic-ai/claude-code
 
       - name: Detectar spec pusheado
@@ -69,6 +72,7 @@ jobs:
           pip install -r lambdas/publish_telegram/requirements.txt
 
       - name: Ejecutar spec con Claude Code
+        if: false
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
@@ -146,46 +150,52 @@ jobs:
         run: |
           git push origin ${{ steps.spec.outputs.branch }}
 
+      # Con Claude omitido no hay CLI `claude` aquí: descripción mínima en bash para no romper Crear PR (restaurá el bloque con claude cuando quites los `if: false`).
       - name: Generar descripción del PR
-        env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
-          SPEC_CONTENT=$(tail -n 200 "specs/done/${{ steps.spec.outputs.ticket }}.md" 2>/dev/null || echo "Spec no disponible")
-          DIFF_STAT=$(git diff main...${{ steps.spec.outputs.branch }} --stat 2>/dev/null || echo "Sin diff disponible")
+          TICKET="${{ steps.spec.outputs.ticket }}"
+          SPEC_CONTENT=$(tail -n 200 "specs/done/${TICKET}.md" 2>/dev/null || echo "Spec no disponible")
+          DIFF_STAT=$(git diff "main...HEAD" --stat 2>/dev/null || echo "Sin diff disponible")
           TEST_OUTPUT=$(tail -n 200 /tmp/test-output.txt 2>/dev/null || echo "Sin output de tests")
 
-          claude -p "
-          Generá la descripción de un Pull Request en español para el proyecto Pulso IA.
-          Usá formato markdown. Sé conciso (máximo 25 líneas).
+          {
+            printf '%s\n\n' "## ¿Qué hace este PR?"
+            printf '%s\n\n' "**Smoke-test de pipeline**: Claude omitido temporalmente (`if: false` en el workflow)."
+            printf '%s\n\n' "### Extracto del spec"
+            printf '%s\n\n' "${SPEC_CONTENT}"
+            printf '%s\n\n' "### Diff (stat contra \`main\`)"
+            printf '%s\n' '```'
+            printf '%s\n' "${DIFF_STAT}"
+            printf '%s\n\n' '```'
+            printf '%s\n\n' "### Estado de los tests (pytest)"
+            printf '%s\n' '```'
+            printf '%s\n' "${TEST_OUTPUT}"
+            printf '%s\n' '```'
+          } > /tmp/pr-description.md
 
-          Incluí estas secciones:
-          ## ¿Qué hace este PR?
-          ## Archivos modificados
-          ## Cómo testear localmente
-          ## Estado de los tests
-
-          SPEC ORIGINAL:
-          $SPEC_CONTENT
-
-          DIFF STAT:
-          $DIFF_STAT
-
-          OUTPUT DE TESTS:
-          $TEST_OUTPUT
-          " --max-turns 1 --output-format text > /tmp/pr-description.md
-
+      # Usamos la REST API directamente: `gh pr create` en CI suele romperse (etiquetas, stderr, exit codes opacos).
       - name: Crear PR automático
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+
           REPO="${{ github.repository }}"
           OWNER="${{ github.repository_owner }}"
           BRANCH="${{ steps.spec.outputs.branch }}"
           TICKET="${{ steps.spec.outputs.ticket }}"
-          HEAD_FILTER="${OWNER}:${BRANCH}"
+          API="${GITHUB_API_URL:-https://api.github.com}"
+          AUTH=( -H "Authorization: Bearer ${GITHUB_TOKEN}"
+                 -H "Accept: application/vnd.github+json"
+                 -H "X-GitHub-Api-Version: 2022-11-28" )
 
-          gh version
+          # Respuestas JSON de error pueden ser largas: buscamos señales de duplicado sin depender sólo del CLI.
+          gh_pr_duplicate_message() {
+            grep -qiE 'A pull request already exists|(pull.?request).{0,120}already|already.{0,40}exist|duplicate' "$1"
+
+          }
+
+          echo "Creando PR vía REST (sin gh CLI): repo=${REPO} branch=${BRANCH}"
 
           if [ ! -s /tmp/pr-description.md ]; then
             printf '%s\n\n%s\n\n%s\n\n%s\n' \
@@ -196,72 +206,101 @@ jobs:
               > /tmp/pr-description.md
           fi
 
-          # Sin estas etiquetas en el repo, `gh pr create --label` devuelve exit 1 (error típico en CI).
-          gh label create "ai-generated" --color "1D76DB" --description "Pipeline spec-executor / Claude" 2>/dev/null || true
-          gh label create "needs-review" --color "FBCA04" --description "Revisión humana sugerida" 2>/dev/null || true
+          DEFAULT_BRANCH="$(curl -fsS "${AUTH[@]}" "${API}/repos/${REPO}" | jq -r '.default_branch // empty')"
+          if [ -z "${DEFAULT_BRANCH}" ]; then
+            DEFAULT_BRANCH="main"
+            echo "::warning::No se pudo leer default_branch; usando 'main' como base."
+          fi
+          echo "Base del PR: ${DEFAULT_BRANCH}"
 
-          EXISTING=""
-          for hf in "${HEAD_FILTER}" "${BRANCH}"; do
-            CAND=$(gh pr list --repo "${REPO}" --head "${hf}" --state open \
-              --json number --jq '.[0].number // empty' 2>/dev/null || true)
-            if [ -n "${CAND}" ]; then
-              EXISTING="${CAND}"
-              break
-            fi
-          done
+          # Etiquetas (best-effort; no bloquean el PR)
+          curl -sS "${AUTH[@]}" -X POST "${API}/repos/${REPO}/labels" \
+            -d '{"name":"ai-generated","color":"1D76DB","description":"Pipeline spec-executor"}' >/dev/null 2>&1 || true
+          curl -sS "${AUTH[@]}" -X POST "${API}/repos/${REPO}/labels" \
+            -d '{"name":"needs-review","color":"FBCA04","description":"Revisión humana"}' >/dev/null 2>&1 || true
 
-          if [ -n "${EXISTING}" ]; then
-            echo "Ya existe el PR #${EXISTING} para la rama. Evitamos duplicados."
+          # ¿Ya hay PR abierto para esta cabeza? (filtro oficial: usuario|org:rama)
+          OPEN_JSON="$(curl -fsS "${AUTH[@]}" -G "${API}/repos/${REPO}/pulls" \
+            --data-urlencode "head=${OWNER}:${BRANCH}" \
+            --data "state=open" \
+            --data "per_page=5")"
+
+          OPEN_N="$(echo "${OPEN_JSON}" | jq 'if type == "array" then length else 0 end')"
+          if [ "${OPEN_N:-0}" -gt 0 ]; then
+            EXISTING="$(echo "${OPEN_JSON}" | jq -r '.[0].html_url // empty')"
+            echo "Ya existe un PR abierto para ${OWNER}:${BRANCH}: ${EXISTING}"
             exit 0
           fi
 
           PR_TITLE="feat(${TICKET}): implementación IA"
-          COMMON_ARGS=(
-            --repo "${REPO}"
-            --title "${PR_TITLE}"
-            --body-file /tmp/pr-description.md
-            --base main
-            --head "${BRANCH}"
-          )
-
-          LABEL_ARGS=( --label "ai-generated" --label "needs-review" )
+          PAYLOAD="$(jq -n \
+            --arg title "${PR_TITLE}" \
+            --arg head "${BRANCH}" \
+            --arg base "${DEFAULT_BRANCH}" \
+            --rawfile body /tmp/pr-description.md \
+            '{title:$title, head:$head, base:$base, body:$body}')"
 
           set +e
-          FIRST_OUT=$(gh pr create "${COMMON_ARGS[@]}" "${LABEL_ARGS[@]}" 2>&1)
-          FIRST_RC=$?
+          HTTP="$(curl -sS -w '%{http_code}' -o /tmp/gh-create-pr.json \
+            "${AUTH[@]}" \
+            -X POST "${API}/repos/${REPO}/pulls" \
+            -d "${PAYLOAD}")"
+          RC=$?
           set -euo pipefail
 
-          if [ "${FIRST_RC}" -eq 0 ]; then
-            echo "${FIRST_OUT}"
-            echo "PR creado con etiquetas."
-            exit 0
-          fi
-          echo "gh pr create (con labels) código ${FIRST_RC}:"
-          echo "${FIRST_OUT}"
-
-          if echo "${FIRST_OUT}" | grep -qiE '(pull request|pull requests).{0,140}already|already exists'; then
-            echo "PR ya existía según respuesta de la API."
-            exit 0
+          if [ "${RC}" != 0 ]; then
+            echo "::error::Fallo curl al crear PR (red o curl): código ${RC}"
+            exit 1
           fi
 
-          set +e
-          SECOND_OUT=$(gh pr create "${COMMON_ARGS[@]}" 2>&1)
-          SECOND_RC=$?
-          set -euo pipefail
+          if [ "${HTTP}" = "201" ]; then
+            PR_URL="$(jq -r '.html_url // empty' /tmp/gh-create-pr.json)"
+            PR_NUM="$(jq -r '.number // empty' /tmp/gh-create-pr.json)"
+            echo "PR creado: ${PR_URL}"
 
-          if [ "${SECOND_RC}" -eq 0 ]; then
-            echo "${SECOND_OUT}"
-            echo "::warning::PR creado sin etiquetas (revisá permisos o creá manualmente ai-generated / needs-review)."
+            # Etiquetas en la issue enlazada (best-effort)
+            curl -sS "${AUTH[@]}" -X POST "${API}/repos/${REPO}/issues/${PR_NUM}/labels" \
+              -d '{"labels":["ai-generated","needs-review"]}' >/dev/null 2>&1 \
+              || echo "::notice::PR creado; no se aplicaron etiquetas (normal si falta scope o etiquetas)."
             exit 0
           fi
 
-          echo "::error::gh pr create (sin labels) código ${SECOND_RC}:"
-          echo "${SECOND_OUT}"
+          cat /tmp/gh-create-pr.json
+          echo "HTTP=${HTTP}"
 
-          if echo "${SECOND_OUT}" | grep -qiE '(pull request|pull requests).{0,140}already|already exists'; then
+          if [ "${HTTP}" = "422" ] && gh_pr_duplicate_message /tmp/gh-create-pr.json; then
+            echo "GitHub informa que ya hay un PR o equivalente — no fallamos el job."
             exit 0
           fi
 
+          # Fallback: algunas cuentas aceptan head como "owner:rama" cuando la rama es ambigua en orgs.
+          if [ "${HTTP}" != "201" ]; then
+            ALT="$(jq -n \
+              --arg title "${PR_TITLE}" \
+              --arg head "${OWNER}:${BRANCH}" \
+              --arg base "${DEFAULT_BRANCH}" \
+              --rawfile body /tmp/pr-description.md \
+              '{title:$title, head:$head, base:$base, body:$body}')"
+
+            set +e
+            HTTP2="$(curl -sS -w '%{http_code}' -o /tmp/gh-create-pr-2.json \
+              "${AUTH[@]}" \
+              -X POST "${API}/repos/${REPO}/pulls" \
+              -d "${ALT}")"
+            set -euo pipefail
+
+            if [ "${HTTP2}" = "201" ]; then
+              echo "PR creado (head=${OWNER}:${BRANCH}): $(jq -r '.html_url' /tmp/gh-create-pr-2.json)"
+              exit 0
+            fi
+            cat /tmp/gh-create-pr-2.json
+            echo "HTTP2=${HTTP2}"
+            if [ "${HTTP2}" = "422" ] && gh_pr_duplicate_message /tmp/gh-create-pr-2.json; then
+              exit 0
+            fi
+          fi
+
+          echo "::error::No se pudo crear el PR (HTTP=${HTTP}). Revisá el JSON anterior y permisos del GITHUB_TOKEN (Workflow permissions → Read and write)."
           exit 1
 
       - name: Resumen del run
