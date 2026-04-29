@@ -15,6 +15,40 @@ table = dynamodb.Table(TABLE_NAME)
 GSI_TELEGRAM = "telegram_sent-processed_at-index"
 
 
+_STOPWORDS = {
+    "el", "la", "los", "las", "de", "del", "en", "y", "a",
+    "the", "of", "for", "with", "and", "or", "is", "to",
+}
+
+
+def _significant_words(title: str) -> set:
+    return {w for w in title.lower().split() if w and w not in _STOPWORDS}
+
+
+def find_near_duplicate_ids(items) -> set:
+    """Retorna item_ids a descartar por título near-duplicado (lógica pura, sin AWS)."""
+    discard: set = set()
+    n = len(items)
+    for i in range(n):
+        if items[i].item_id in discard:
+            continue
+        words_i = _significant_words(items[i].title)
+        for j in range(i + 1, n):
+            if items[j].item_id in discard:
+                continue
+            words_j = _significant_words(items[j].title)
+            union = words_i | words_j
+            if not union:
+                continue
+            if len(words_i & words_j) / len(union) > 0.60:
+                if items[i].published_at >= items[j].published_at:
+                    discard.add(items[j].item_id)
+                else:
+                    discard.add(items[i].item_id)
+                    break
+    return discard
+
+
 def batch_get_existing_ids(item_ids: List[str]) -> set:
     """Retorna el set de item_ids que ya existen en DynamoDB."""
     existing = set()
