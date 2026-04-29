@@ -26,15 +26,12 @@ jobs:
         with:
           python-version: '3.12'
 
-      # Temporal: sin Node/Claude para correr rápido el pipeline y probar push/rama/tests/PR (quitar estos `if: false`).
       - name: Setup Node.js 22 (para Claude Code CLI)
-        if: false
         uses: actions/setup-node@v4
         with:
           node-version: '22'
 
       - name: Instalar Claude Code CLI
-        if: false
         run: npm install -g @anthropic-ai/claude-code
 
       - name: Detectar spec pusheado
@@ -72,7 +69,6 @@ jobs:
           pip install -r lambdas/publish_telegram/requirements.txt
 
       - name: Ejecutar spec con Claude Code
-        if: false
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
@@ -150,28 +146,33 @@ jobs:
         run: |
           git push origin ${{ steps.spec.outputs.branch }}
 
-      # Con Claude omitido no hay CLI `claude` aquí: descripción mínima en bash para no romper Crear PR (restaurá el bloque con claude cuando quites los `if: false`).
       - name: Generar descripción del PR
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
-          TICKET="${{ steps.spec.outputs.ticket }}"
-          SPEC_CONTENT=$(tail -n 200 "specs/done/${TICKET}.md" 2>/dev/null || echo "Spec no disponible")
-          DIFF_STAT=$(git diff "main...HEAD" --stat 2>/dev/null || echo "Sin diff disponible")
+          SPEC_CONTENT=$(tail -n 200 "specs/done/${{ steps.spec.outputs.ticket }}.md" 2>/dev/null || echo "Spec no disponible")
+          DIFF_STAT=$(git diff "main...${{ steps.spec.outputs.branch }}" --stat 2>/dev/null || echo "Sin diff disponible")
           TEST_OUTPUT=$(tail -n 200 /tmp/test-output.txt 2>/dev/null || echo "Sin output de tests")
 
-          {
-            printf '%s\n\n' "## ¿Qué hace este PR?"
-            printf '%s\n\n' "**Smoke-test de pipeline**: Claude omitido temporalmente (`if: false` en el workflow)."
-            printf '%s\n\n' "### Extracto del spec"
-            printf '%s\n\n' "${SPEC_CONTENT}"
-            printf '%s\n\n' "### Diff (stat contra \`main\`)"
-            printf '%s\n' '```'
-            printf '%s\n' "${DIFF_STAT}"
-            printf '%s\n\n' '```'
-            printf '%s\n\n' "### Estado de los tests (pytest)"
-            printf '%s\n' '```'
-            printf '%s\n' "${TEST_OUTPUT}"
-            printf '%s\n' '```'
-          } > /tmp/pr-description.md
+          claude -p "
+          Generá la descripción de un Pull Request en español para el proyecto Pulso IA.
+          Usá formato markdown. Sé conciso (máximo 25 líneas).
+
+          Incluí estas secciones:
+          ## ¿Qué hace este PR?
+          ## Archivos modificados
+          ## Cómo testear localmente
+          ## Estado de los tests
+
+          SPEC ORIGINAL:
+          $SPEC_CONTENT
+
+          DIFF STAT:
+          $DIFF_STAT
+
+          OUTPUT DE TESTS:
+          $TEST_OUTPUT
+          " --max-turns 1 --output-format text > /tmp/pr-description.md
 
       # Usamos la REST API directamente: `gh pr create` en CI suele romperse (etiquetas, stderr, exit codes opacos).
       - name: Crear PR automático
